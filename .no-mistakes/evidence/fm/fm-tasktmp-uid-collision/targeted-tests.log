@@ -1,0 +1,9 @@
+fm-gotmp rc=0 4 ok, 0 not ok
+ok - fm-teardown removes the dir pointed to by tasktmp= in meta
+ok - fm-teardown removes a legacy /tmp/fm-<id> recorded by a task spawned before the per-user namespace
+ok - fm-teardown skips gracefully when tasktmp= is absent (backward compat)
+ok - fm-teardown skips gracefully when tasktmp= points to a nonexistent dir
+fm-control-relaunch rc=0 74 ok, 0 not ok
+ok - fm-control relaunch: a recorded legacy task temp root is kept only while it is this user's private directory
+fm-kimi-harness rc=0 32 ok, 0 not ok
+ok - fm-spawn: a legacy shared /tmp/fm-<id> no longer blocks or receives the task temp root

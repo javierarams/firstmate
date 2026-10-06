@@ -1,0 +1,49 @@
+## lab session: fm-lab-tmpuid-18612   uid: 501
+
+################ S1: happy path spawn -> per-uid tasktmp -> teardown
+spawn rc=0
+meta tasktmp=/tmp/firstmate-tasks-501/tu18612-happy
+namespace /tmp/firstmate-tasks-501: 700 javieraramberri(501)
+task root  /tmp/firstmate-tasks-501/tu18612-happy: 700 javieraramberri(501)
+/tmp/firstmate-tasks-501/tu18612-happy/gotmp
+legacy /tmp/fm-tu18612-happy exists? no
+teardown rc=0
+task root after teardown exists? no
+namespace after teardown: 700 javieraramberri(501)
+
+################ S2: the collision - another user's /tmp/fm-<id> already exists
+(stand-in: a 0777 dir; a portable non-root fixture cannot chown to uid 502)
+pre-existing /tmp/fm-tu18612-collide: 777 javieraramberri(501)
+--- BEFORE (base 26ba1c7):
+spawn rc=1
+error: task temp root /tmp/fm-tu18612-collide already exists and is not a private directory owned by this user; refusing to stage the launch command there; inspect and remove it, then retry
+--- AFTER (this change):
+spawn rc=0
+meta tasktmp=/tmp/firstmate-tasks-501/tu18612-collide  (700 javieraramberri(501))
+legacy /tmp/fm-tu18612-collide untouched: 777 javieraramberri(501) entries=[]
+teardown rc=0
+after teardown: task root exists? no; legacy still present (not ours to remove)? yes
+
+################ S3: refuse, not degrade - namespace for this uid owned by someone else
+(fake uid 105234 via PATH 'id' shim; /tmp/firstmate-tasks-105234 is 700 javieraramberri(501), i.e. squatted by another uid)
+spawn rc=1
+error: task temp namespace /tmp/firstmate-tasks-105234 is not a directory owned by this user with mode 700; refusing to create the task temp root there; inspect it, then retry
+no meta written (refused before any task state)
+foreign namespace contents: []  mode still: 700 javieraramberri(501)
+fallback /tmp/fm-tu18612-foreign created? no
+
+################ S4: refuse - namespace path is a symlink planted to a dir
+spawn rc=1
+error: task temp namespace /tmp/firstmate-tasks-105235 is not a directory owned by this user with mode 700; refusing to create the task temp root there; inspect it, then retry
+planted target contents: []
+no meta written
+
+################ S5: herdr presentation lock (refactored onto the same lib) still works
+drwx------@ javieraramberri /tmp/firstmate-herdr-presentation-501
+warning: herdr presentation parent is absent or ambiguous; using the ordinary flat layout without projection
+s1 spawn output tail:
+warning: /private/var/folders/n1/7vkblp1d4lj_hc9_t82w28680000gn/T/fm-tasktmp-live.uAWEya/h1/data/tu18612-happy/launch-brief.md records no ship branch; defaulting to legacy branch fm/tu18612-happy
+warning: /private/var/folders/n1/7vkblp1d4lj_hc9_t82w28680000gn/T/fm-tasktmp-live.uAWEya/h1/data/tu18612-happy/launch-brief.md records no delivery contract line (scaffolded before ship briefs recorded one); launching on the explicit --mode no-mistakes - confirm its definition of done matches
+warning: herdr presentation parent is absent or ambiguous; using the ordinary flat layout without projection
+spawned tu18612-happy harness=sh kind=ship mode=no-mistakes yolo=off window=fm-lab-tmpuid-18612:w1:p2 worktree=/Users/javieraramberri/.treehouse/proj-36c439/1/proj
+DONE
