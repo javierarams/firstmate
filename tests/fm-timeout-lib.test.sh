@@ -109,7 +109,7 @@ test_the_bound_replaces_the_calling_shell() {
     rm -f "$dir/caller" "$dir/parent"
     (
       . "$ROOT/bin/fm-timeout-lib.sh"
-      printf '%s\n' "$BASHPID" > "$dir/caller"
+      sh -c 'echo "$PPID"' > "$dir/caller"
       PATH=$path fm_exec_timed 5 1 bash -c 'echo "$PPID" > "$1"' _ "$dir/parent"
     ) || fail "the bounded probe failed under PATH=$path"
     caller=$(cat "$dir/caller")
@@ -118,6 +118,42 @@ test_the_bound_replaces_the_calling_shell() {
       || fail "the command's parent $parent is not the replaced caller $caller under PATH=$path"
   done
   pass "fm_exec_timed replaces the calling shell instead of wrapping it"
+}
+
+# Stock macOS Bash 3.2 has no BASHPID; unsetting it reproduces that shell on
+# any Bash, so a nounset caller must still be bounded and replaced, both as a
+# script's top-level command and from a subshell.
+test_the_bound_runs_without_bashpid() {
+  local dir path caller parent rc
+  dir="$TMP_ROOT/no-bashpid"
+  mkdir -p "$dir"
+  for path in "$PATH" "$PERL_ONLY"; do
+    rm -f "$dir/caller" "$dir/parent"
+    rc=0
+    PATH=$path bash -c '
+      set -u
+      unset BASHPID
+      . "$1/bin/fm-timeout-lib.sh"
+      echo "$$" > "$2/caller"
+      fm_exec_timed 5 1 bash -c "echo \"\$PPID\" > \"\$1\"" _ "$2/parent"
+    ' _ "$ROOT" "$dir" 2>"$dir/err" || rc=$?
+    [ "$rc" -eq 0 ] || fail "a top-level call without BASHPID failed (rc=$rc) under PATH=$path: $(cat "$dir/err")"
+    caller=$(cat "$dir/caller")
+    parent=$(cat "$dir/parent")
+    [ "$caller" = "$parent" ] \
+      || fail "the command's parent $parent is not the replaced top-level caller $caller under PATH=$path"
+    rc=0
+    PATH=$path bash -c '
+      set -u
+      unset BASHPID
+      . "$1/bin/fm-timeout-lib.sh"
+      ( fm_exec_timed 5 1 bash -c ": > \"\$1\"" _ "$2/ran" )
+    ' _ "$ROOT" "$dir" 2>"$dir/err" || rc=$?
+    [ "$rc" -eq 0 ] && [ -e "$dir/ran" ] \
+      || fail "a subshell call without BASHPID failed (rc=$rc) under PATH=$path: $(cat "$dir/err")"
+    rm -f "$dir/ran"
+  done
+  pass "fm_exec_timed bounds a nounset caller on a Bash without BASHPID"
 }
 
 # The regression a direct-child watchdog had: the command dies at the bound
@@ -204,28 +240,32 @@ test_a_named_owner_that_is_gone_ends_the_command() {
 # fm_exec_timed - the watchdog then starts already reparented - is still
 # detected instead of leaving the command running to its bound.
 test_an_owner_that_dies_during_startup_ends_the_command() {
-  local dir watchdog started
-  dir="$TMP_ROOT/startup-owner"
-  mkdir -p "$dir"
-  # shellcheck disable=SC2016
-  PATH=$PERL_ONLY bash -c '
-    . "$1/bin/fm-timeout-lib.sh"
-    (
-      echo "$BASHPID" > "$2/watchdog"
-      while kill -0 "$$" 2>/dev/null; do sleep 0.05; done
-      fm_exec_timed 60 1 bash -c "exec sleep 300"
-    ) >/dev/null 2>&1 &
-    exit 0
-  ' _ "$ROOT" "$dir"
-  wait_for_file "$dir/watchdog"
-  watchdog=$(cat "$dir/watchdog")
-  started=$SECONDS
-  while kill -0 "$watchdog" 2>/dev/null; do
-    if [ "$((SECONDS - started))" -ge 15 ]; then
-      kill -KILL "$watchdog" 2>/dev/null || true
-      fail "a watchdog whose owner died during startup ran on toward its bound"
-    fi
-    sleep 0.02
+  local dir watchdog started bashpid
+  # The second pass drops BASHPID, as stock macOS Bash 3.2 has none.
+  for bashpid in keep drop; do
+    dir="$TMP_ROOT/startup-owner-$bashpid"
+    mkdir -p "$dir"
+    # shellcheck disable=SC2016
+    PATH=$PERL_ONLY bash -c '
+      . "$1/bin/fm-timeout-lib.sh"
+      (
+        bash -c "echo \"\$PPID\"" > "$2/watchdog"
+        [ "$3" = keep ] || unset BASHPID
+        while kill -0 "$$" 2>/dev/null; do sleep 0.05; done
+        fm_exec_timed 60 1 bash -c "exec sleep 300"
+      ) >/dev/null 2>&1 &
+      exit 0
+    ' _ "$ROOT" "$dir" "$bashpid"
+    wait_for_file "$dir/watchdog"
+    watchdog=$(cat "$dir/watchdog")
+    started=$SECONDS
+    while kill -0 "$watchdog" 2>/dev/null; do
+      if [ "$((SECONDS - started))" -ge 15 ]; then
+        kill -KILL "$watchdog" 2>/dev/null || true
+        fail "a watchdog whose owner died during startup ran on toward its bound (BASHPID $bashpid)"
+      fi
+      sleep 0.02
+    done
   done
   pass "fm_exec_timed ends the command when its owner dies during watchdog startup"
 }
@@ -333,6 +373,7 @@ test_run_timed_passes_a_natural_exit_through_a_fired_bound
 test_term_ends_a_cooperative_command_at_the_bound
 test_kill_ends_a_term_ignoring_command_after_the_grace
 test_the_bound_replaces_the_calling_shell
+test_the_bound_runs_without_bashpid
 test_a_descendant_holding_the_output_cannot_outlast_the_bound
 test_a_signal_to_the_bounding_process_reaches_the_command
 test_a_named_owner_that_is_gone_ends_the_command
