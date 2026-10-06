@@ -1,0 +1,10 @@
+== AFTER (4270b16) ==
+bash=3.2.57(1)-release
+normal turn rc=0 result={"type":"result","is_error":false,"result":"stub turn ok"} err=
+hung turn rc=124 after 2s timed_out=yes err=
+exit=0
+== BEFORE (70f2ed3 lib) ==
+bash=3.2.57(1)-release
+normal turn rc=1 result= err=/var/folders/n1/7vkblp1d4lj_hc9_t82w28680000gn/T/tmp.oDbRTSuQwC/bin/fm-timeout-lib.sh: line 224: BASHPID: unbound variable
+hung turn rc=1 after 0s timed_out=no err=/var/folders/n1/7vkblp1d4lj_hc9_t82w28680000gn/T/tmp.oDbRTSuQwC/bin/fm-timeout-lib.sh: line 224: BASHPID: unbound variable
+exit=0
