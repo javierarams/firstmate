@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
 # Behavior tests for per-task GOTMPDIR support (fm-gotmp).
 #
-# fm-spawn gives each task a temp root /tmp/fm-<id>/ with Go's build temp nested at
-# gotmp/, exports GOTMPDIR into the crewmate pane, and records tasktmp= in the task's
-# meta. fm-teardown reads tasktmp= and removes the whole root on cleanup.
+# fm-spawn gives each task a temp root under the spawning user's /tmp namespace
+# with Go's build temp nested at gotmp/, exports GOTMPDIR into the crewmate pane,
+# and records tasktmp= in the task's meta. fm-teardown reads tasktmp= and removes
+# the whole root on cleanup, including the shared /tmp/fm-<id>/ root that tasks
+# spawned before the per-user namespace recorded.
 #
 # These tests exercise fm-teardown directly as a subprocess against a fake FM_HOME/FM_ROOT
 # built so the real script resolves into it, with stub helper scripts.
@@ -30,10 +32,14 @@ pass() {
 }
 
 TMP_ROOT=
+LEGACY_TASK_TMP=
 
 cleanup() {
   if [ -n "${TMP_ROOT:-}" ]; then
     rm -rf "$TMP_ROOT"
+  fi
+  if [ -n "${LEGACY_TASK_TMP:-}" ]; then
+    rm -rf "$LEGACY_TASK_TMP"
   fi
 }
 trap cleanup EXIT
@@ -68,6 +74,7 @@ SH
   ln -s "$ROOT/bin/fm-lock-lib.sh" "$fake/bin/fm-lock-lib.sh"
   # fm-lease-lib.sh: teardown sources it for the supervision lease guard.
   ln -s "$ROOT/bin/fm-lease-lib.sh" "$fake/bin/fm-lease-lib.sh"
+  ln -s "$ROOT/bin/fm-supervision-engine-lib.sh" "$fake/bin/fm-supervision-engine-lib.sh"
   # Lifecycle serialization, status presentation retirement, and shared adapter
   # ownership are sourced by teardown.
   ln -s "$ROOT/bin/fm-control-lib.sh" "$fake/bin/fm-control-lib.sh"
@@ -154,6 +161,22 @@ test_teardown_removes_tasktmp_dir() {
   pass "fm-teardown removes the dir pointed to by tasktmp= in meta"
 }
 
+test_teardown_removes_a_recorded_legacy_tasktmp_dir() {
+  local id="td-legacy-z5-$$"
+  local task_tmp="/tmp/fm-$id"
+  local fake
+  LEGACY_TASK_TMP=$task_tmp
+  rm -rf "$task_tmp"
+  mkdir -p "$task_tmp/gotmp"
+  printf 'leftover\n' > "$task_tmp/gotmp/build-artifact"
+  fake=$(make_fake_root "$id" "$task_tmp")
+  FM_HOME="$fake" bash "$fake/bin/fm-teardown.sh" "$id" >/dev/null 2>&1 \
+    || fail "teardown exited non-zero with a legacy tasktmp"
+  [ ! -e "$task_tmp" ] \
+    || fail "teardown did not remove the legacy tasktmp dir ($task_tmp still exists)"
+  pass "fm-teardown removes a legacy /tmp/fm-<id> recorded by a task spawned before the per-user namespace"
+}
+
 test_teardown_skips_gracefully_without_tasktmp() {
   # Backward compat: a meta from a pre-fix task has no tasktmp= line. Teardown must
   # not error and must not remove anything.
@@ -175,6 +198,7 @@ SH
   ln -s "$ROOT/bin/fm-lock-lib.sh" "$fake/bin/fm-lock-lib.sh"
   # fm-lease-lib.sh: teardown sources it for the supervision lease guard.
   ln -s "$ROOT/bin/fm-lease-lib.sh" "$fake/bin/fm-lease-lib.sh"
+  ln -s "$ROOT/bin/fm-supervision-engine-lib.sh" "$fake/bin/fm-supervision-engine-lib.sh"
   ln -s "$ROOT/bin/fm-control-lib.sh" "$fake/bin/fm-control-lib.sh"
   ln -s "$ROOT/bin/fm-classify-lib.sh" "$fake/bin/fm-classify-lib.sh"
   # fm-timeout-lib.sh: the shared hard bound fm-classify-lib.sh sources for the
@@ -248,5 +272,6 @@ test_teardown_skips_gracefully_when_dir_missing() {
 }
 
 test_teardown_removes_tasktmp_dir
+test_teardown_removes_a_recorded_legacy_tasktmp_dir
 test_teardown_skips_gracefully_without_tasktmp
 test_teardown_skips_gracefully_when_dir_missing

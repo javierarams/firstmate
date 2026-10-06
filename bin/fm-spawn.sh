@@ -649,6 +649,8 @@ fm_backlog_directory_present "$STATE" "state directory" || {
 . "$SCRIPT_DIR/fm-timeout-lib.sh"
 # shellcheck source=bin/fm-worker-account-lib.sh
 . "$SCRIPT_DIR/fm-worker-account-lib.sh"
+# shellcheck source=bin/fm-user-tmp-lib.sh
+. "$SCRIPT_DIR/fm-user-tmp-lib.sh"
 # Fail closed before any fleet mutation: a no-mistakes gate agent must never spawn
 # a direct report (see bin/fm-gate-refuse-lib.sh).
 fm_refuse_if_gate_agent
@@ -4447,24 +4449,35 @@ agy)
   ;;
 esac
 
-# Per-task temp root: /tmp/fm-<id>/ with Go's build temp nested at gotmp/. Go won't
+# Per-task temp root: <id>/ under this user's /tmp namespace
+# (bin/fm-user-tmp-lib.sh), with Go's build temp nested at gotmp/. Go won't
 # create GOTMPDIR, so mkdir before it is used; fm-teardown removes the whole root.
-# Nested (not a bare /tmp/fm-<id>/gotmp) so other per-task temp can live alongside
+# Nested (not a bare <id>/gotmp) so other per-task temp can live alongside
 # later, and teardown cleans one deterministic path. GOTMPDIR (not TMPDIR) is the
 # targeted knob: TMPDIR is too broad (affects every program's temp, not just Go's).
-# The root is private (0700) because its path is predictable under a shared
-# /tmp: a root that already exists is reused only as a real directory owned by
-# this user and writable by nobody else, then tightened, so no other local user
-# can plant or swap a file in it. The staged launch command lives in a sibling
-# directory namespaced by home identity, not in this shared per-id root.
-TASK_TMP="/tmp/fm-$ID"
-if ! (umask 077 && mkdir "$TASK_TMP") 2>/dev/null; then
-  if [ -L "$TASK_TMP" ] || [ ! -d "$TASK_TMP" ] || [ ! -O "$TASK_TMP" ] ||
-    [ -n "$(find "$TASK_TMP" -prune \( -perm -g=w -o -perm -o=w \) -print 2>/dev/null)" ] ||
-    ! chmod 700 "$TASK_TMP"; then
-    echo "error: task temp root $TASK_TMP already exists and is not a private directory owned by this user; refusing to stage the launch command there; inspect and remove it, then retry" >&2
-    exit 1
-  fi
+# A root that already exists is reused only as a real directory owned by this
+# user and writable by nobody else, then tightened to 0700.
+spawn_private_dir_reusable() {  # <dir>
+  [ ! -L "$1" ] && [ -d "$1" ] && [ -O "$1" ] &&
+    [ -z "$(find "$1" -prune \( -perm -g=w -o -perm -o=w \) -print 2>/dev/null)" ] &&
+    chmod 700 "$1"
+}
+TASK_TMP_NAMESPACE=$(fm_user_tmp_namespace firstmate-tasks) || TASK_TMP_NAMESPACE=
+if [ -z "$TASK_TMP_NAMESPACE" ] || ! fm_user_tmp_namespace_ensure "$TASK_TMP_NAMESPACE"; then
+  echo "error: task temp namespace ${TASK_TMP_NAMESPACE:-/tmp/firstmate-tasks-<uid>} is not a directory owned by this user with mode 700; refusing to create the task temp root there; inspect it, then retry" >&2
+  exit 1
+fi
+TASK_TMP="$TASK_TMP_NAMESPACE/$ID"
+# A task spawned before the per-user namespace recorded the shared legacy
+# /tmp/fm-<id> root. Its relaunch keeps that root while it is still this
+# user's private directory, so teardown's recorded tasktmp= stays the root the
+# task's processes use.
+if [ "$RELAUNCH" -eq 1 ] && [ "$(fm_meta_get "$RELAUNCH_META" tasktmp)" = "/tmp/fm-$ID" ] &&
+  spawn_private_dir_reusable "/tmp/fm-$ID"; then
+  TASK_TMP="/tmp/fm-$ID"
+elif ! (umask 077 && mkdir "$TASK_TMP") 2>/dev/null && ! spawn_private_dir_reusable "$TASK_TMP"; then
+  echo "error: task temp root $TASK_TMP already exists and is not a private directory owned by this user; refusing to use it; inspect and remove it, then retry" >&2
+  exit 1
 fi
 mkdir -p "$TASK_TMP/gotmp"
 
@@ -5399,13 +5412,9 @@ case "$SPAWN_GEN" in
   *[!A-Za-z0-9.]*|'') echo "error: spawn incarnation token is not a usable launch-file nonce" >&2; exit 1 ;;
 esac
 LAUNCH_DIR="/tmp/fm-$ID+$LAUNCH_HOME_TOKEN"
-if ! (umask 077 && mkdir "$LAUNCH_DIR") 2>/dev/null; then
-  if [ -L "$LAUNCH_DIR" ] || [ ! -d "$LAUNCH_DIR" ] || [ ! -O "$LAUNCH_DIR" ] ||
-    [ -n "$(find "$LAUNCH_DIR" -prune \( -perm -g=w -o -perm -o=w \) -print 2>/dev/null)" ] ||
-    ! chmod 700 "$LAUNCH_DIR"; then
-    echo "error: task launch directory $LAUNCH_DIR already exists and is not a private directory owned by this user; refusing to stage the launch command there; inspect and remove it, then retry" >&2
-    exit 1
-  fi
+if ! (umask 077 && mkdir "$LAUNCH_DIR") 2>/dev/null && ! spawn_private_dir_reusable "$LAUNCH_DIR"; then
+  echo "error: task launch directory $LAUNCH_DIR already exists and is not a private directory owned by this user; refusing to stage the launch command there; inspect and remove it, then retry" >&2
+  exit 1
 fi
 LAUNCH_FILE="$LAUNCH_DIR/launch.$SPAWN_GEN.sh"
 LAUNCH_STAGE="$LAUNCH_DIR/.launch.$SPAWN_GEN.tmp"

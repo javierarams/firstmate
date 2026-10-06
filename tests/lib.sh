@@ -250,6 +250,16 @@ fm_test_remove_tree() {
   rm -rf "$dir"
 }
 
+# The task temp root fm-spawn creates for <id> under this user's namespace
+# (bin/fm-user-tmp-lib.sh). Ensures the namespace exists, as a spawn would, so a
+# test can pre-create the root itself.
+fm_test_task_tmp_root() {  # <id>
+  local ns
+  ns=$(bash -c '. "$0/bin/fm-user-tmp-lib.sh" && ns=$(fm_user_tmp_namespace firstmate-tasks) &&
+    fm_user_tmp_namespace_ensure "$ns" && printf "%s" "$ns"' "$ROOT") || return 1
+  printf '%s/%s\n' "$ns" "$1"
+}
+
 fm_test_cleanup() {
   local d
   fm_test_reap_watchers

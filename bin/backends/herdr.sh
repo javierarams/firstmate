@@ -93,6 +93,10 @@ FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
 # shellcheck source=bin/fm-agent-process-lib.sh
 . "$FM_BACKEND_HERDR_ROOT/bin/fm-agent-process-lib.sh"
 
+# Per-user /tmp namespace for the presentation lock (bin/fm-user-tmp-lib.sh).
+# shellcheck source=bin/fm-user-tmp-lib.sh
+. "$FM_BACKEND_HERDR_ROOT/bin/fm-user-tmp-lib.sh"
+
 FM_BACKEND_HERDR_MIN_PROTOCOL=14
 # events.subscribe (the native pane.agent_status_changed push stream) and its
 # subscription_event schema first shipped at protocol 16 (verified: herdr
@@ -779,41 +783,8 @@ fm_backend_herdr_projection_workspace_label() {  # <task-id> <projection-id>
 # The path is never under any one home's state/ and secondmates never write the
 # primary home. Returns non-zero when the named session's socket cannot be
 # resolved unambiguously.
-# The namespace is keyed by uid under a fixed /tmp root rather than $TMPDIR,
-# which differs between interactive shells, launchd jobs, and harness sandboxes
-# and would split one user's processes across unserialized locks.
 fm_backend_herdr_presentation_lock_namespace() {
-  local uid
-  uid=$(id -u 2>/dev/null) || return 1
-  case "$uid" in
-    ''|*[!0-9]*) return 1 ;;
-  esac
-  printf '/tmp/firstmate-herdr-presentation-%s' "$uid"
-}
-
-fm_backend_herdr_presentation_lock_namespace_mode() {
-  if [ "$(uname -s 2>/dev/null)" = Darwin ]; then
-    /usr/bin/stat -f '%Lp' "$1" 2>/dev/null
-  else
-    stat -c '%a' "$1" 2>/dev/null
-  fi
-}
-
-fm_backend_herdr_presentation_lock_namespace_uid() {
-  if [ "$(uname -s 2>/dev/null)" = Darwin ]; then
-    /usr/bin/stat -f '%u' "$1" 2>/dev/null
-  else
-    stat -c '%u' "$1" 2>/dev/null
-  fi
-}
-
-fm_backend_herdr_presentation_lock_namespace_valid() {
-  local dir=$1 expected_uid owner mode
-  [ -d "$dir" ] && [ ! -L "$dir" ] || return 1
-  expected_uid=$(id -u 2>/dev/null) || return 1
-  owner=$(fm_backend_herdr_presentation_lock_namespace_uid "$dir") || return 1
-  mode=$(fm_backend_herdr_presentation_lock_namespace_mode "$dir") || return 1
-  [ "$owner" = "$expected_uid" ] && [ "$mode" = 700 ]
+  fm_user_tmp_namespace firstmate-herdr-presentation
 }
 
 # Resolve the one verified running named-session socket path as an absolute
@@ -875,12 +846,7 @@ fm_backend_herdr_presentation_session_lock_path() {  # <session>
   key=${hash:0:32}
   dir=$(fm_backend_herdr_presentation_lock_namespace) || return 1
   [ -n "$dir" ] || return 1
-  if [ ! -e "$dir" ] && [ ! -L "$dir" ]; then
-    if ! mkdir -m 700 "$dir" 2>/dev/null; then
-      fm_backend_herdr_presentation_lock_namespace_valid "$dir" || return 1
-    fi
-  fi
-  fm_backend_herdr_presentation_lock_namespace_valid "$dir" || return 1
+  fm_user_tmp_namespace_ensure "$dir" || return 1
   printf '%s/order-%s.lock' "$dir" "$key"
 }
 

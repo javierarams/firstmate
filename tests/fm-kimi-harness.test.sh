@@ -18,6 +18,7 @@ KIMI_HOOK="$ROOT/bin/fm-kimi-turnend-hook.sh"
 TMP_ROOT=$(fm_test_tmproot fm-kimi-harness)
 KIMI_RUNTIME_TASK_TMP=
 KIMI_RUNTIME_LAUNCH_DIR=
+KIMI_RUNTIME_LEGACY_TMP=
 PYTHON_BIN=$(command -v python3) || fail "test needs python3"
 PYTHON_BIN_DIR=$(dirname "$PYTHON_BIN")
 JQ_BIN=$(command -v jq) || fail "test needs jq"
@@ -36,8 +37,17 @@ ai_trailer_hooks_prefix() {  # <home> <id>
 }
 
 cleanup_kimi_harness() {
+  local id home
   [ -z "$KIMI_RUNTIME_TASK_TMP" ] || fm_test_remove_tree "$KIMI_RUNTIME_TASK_TMP"
   [ -z "$KIMI_RUNTIME_LAUNCH_DIR" ] || fm_test_remove_tree "$KIMI_RUNTIME_LAUNCH_DIR"
+  [ -z "$KIMI_RUNTIME_LEGACY_TMP" ] || fm_test_remove_tree "$KIMI_RUNTIME_LEGACY_TMP"
+  if [ -f "$TMP_ROOT/spawn-cases" ]; then
+    while IFS=$'\t' read -r id home; do
+      [ -n "$id" ] || continue
+      fm_test_remove_tree "/tmp/firstmate-tasks-$(id -u)/$id"
+      fm_test_remove_tree "$(kimi_launch_dir "$id" "$home")"
+    done < "$TMP_ROOT/spawn-cases"
+  fi
   fm_test_remove_tree "$TMP_ROOT"
 }
 trap cleanup_kimi_harness EXIT
@@ -232,6 +242,7 @@ make_spawn_case() {
   proj="$case_dir/project"
   wt="$case_dir/wt"
   fakebin=$(make_spawn_fakebin "$case_dir/fake")
+  printf '%s\t%s\n' "$id" "$home" >> "$TMP_ROOT/spawn-cases"
   mkdir -p "$home/data/$id" "$home/projects" "$home/state" "$home/config" "$home/.kimi-code"
   printf '# Kimi test config\ndefault_model = "test"\n' > "$home/.kimi-code/config.toml"
   cat > "$home/data/$id/brief.md" <<'EOF'
@@ -290,7 +301,7 @@ EOF
 test_kimi_launch_then_send_is_verified() {
   local id rec out rc launch pointer brief_real meta task_tmp launch_dir launch_file launch_base
   id="kimi-success-z1-$$"
-  task_tmp="/tmp/fm-$id"
+  task_tmp=$(fm_test_task_tmp_root "$id")
   KIMI_RUNTIME_TASK_TMP=$task_tmp
   rm -rf "$task_tmp"
   rec=$(make_spawn_case success "$id")
@@ -379,7 +390,7 @@ kimi_typed_launch_file() {
 test_kimi_spawn_refuses_shared_task_temp_root() {
   local id rec out rc task_tmp launch_dir launch_file stale_file
   id="kimi-sharedtmp-z1-$$"
-  task_tmp="/tmp/fm-$id"
+  task_tmp=$(fm_test_task_tmp_root "$id")
   KIMI_RUNTIME_TASK_TMP=$task_tmp
   rm -rf "$task_tmp"
   mkdir "$task_tmp"
@@ -436,6 +447,85 @@ test_kimi_spawn_refuses_shared_task_temp_root() {
     || fail "kimi spawn did not type a short line sourcing its namespaced launch command"
   rm -rf "$task_tmp" "$launch_dir"
   pass "fm-spawn: unsafe task roots are refused, owned roots are tightened, and launch files stay unique and 0600"
+}
+
+# Another user's /tmp/fm-<id> (a real second user's own task with the same id)
+# was the shared legacy root: this user's spawn refused it and could neither
+# use nor remove it. A world-writable legacy directory stands in for one this
+# user does not own, since a portable test cannot create a foreign-owned path.
+test_kimi_spawn_is_not_blocked_by_a_legacy_shared_task_temp_root() {
+  local id rec out rc legacy task_tmp ns launch_dir
+  id="kimi-legacytmp-z1-$$"
+  legacy="/tmp/fm-$id"
+  KIMI_RUNTIME_LEGACY_TMP=$legacy
+  task_tmp=$(fm_test_task_tmp_root "$id")
+  ns="/tmp/firstmate-tasks-$(id -u)"
+  KIMI_RUNTIME_TASK_TMP=$task_tmp
+  rm -rf "$legacy" "$task_tmp"
+  mkdir "$legacy"
+  chmod 777 "$legacy"
+  rec=$(make_spawn_case legacytmp "$id")
+  read_spawn_record "$rec"
+  launch_dir=$(kimi_launch_dir "$id" "$HOME_DIR")
+  KIMI_RUNTIME_LAUNCH_DIR=$launch_dir
+  rm -rf "$launch_dir"
+  out=$(run_spawn "$CASE_DIR" "$HOME_DIR" "$PROJ_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$id")
+  rc=$?
+  expect_code 0 "$rc" "a spawn must not be blocked by another user's legacy /tmp/fm-<id>: $out"
+  [ "$task_tmp" = "$ns/$id" ] || fail "the task temp root is not under this user's namespace: $task_tmp"
+  assert_grep "tasktmp=$task_tmp" "$HOME_DIR/state/$id.meta" \
+    "the spawn did not record its per-user task temp root"
+  assert_present "$task_tmp/gotmp" "the spawn did not create its per-user Go temp directory"
+  [ "$(path_mode "$ns")" = 700 ] || fail "the task temp namespace is not private: $(path_mode "$ns")"
+  [ "$(path_mode "$task_tmp")" = 700 ] || fail "the task temp root is not private: $(path_mode "$task_tmp")"
+  assert_grep "export GOTMPDIR=$task_tmp/gotmp" "$CASE_DIR/tmux-calls.log" \
+    "the spawn did not export its per-user Go temp directory"
+  [ "$(path_mode "$legacy")" = 777 ] || fail "the spawn changed the legacy shared root"
+  [ -z "$(ls -A "$legacy")" ] || fail "the spawn wrote into the legacy shared root: $(ls -A "$legacy")"
+  rm -rf "$legacy" "$task_tmp" "$launch_dir"
+  pass "fm-spawn: a legacy shared /tmp/fm-<id> no longer blocks or receives the task temp root"
+}
+
+make_fake_id_bin() {  # <dir> -> echoes a fakebin whose `id -u` prints $FM_FAKE_UID
+  local fb="$1/fake-id-bin"
+  mkdir -p "$fb"
+  cat > "$fb/id" <<'SH'
+#!/usr/bin/env bash
+if [ "$#" -eq 1 ] && [ "$1" = -u ]; then
+  printf '%s\n' "$FM_FAKE_UID"
+  exit 0
+fi
+exec /usr/bin/id "$@"
+SH
+  chmod +x "$fb/id"
+  printf '%s' "$fb"
+}
+
+test_kimi_spawn_refuses_a_task_temp_namespace_owned_by_another_uid() {
+  local id rec out rc fake_uid ns idfb existed=0
+  id="kimi-foreignns-z1-$$"
+  rec=$(make_spawn_case foreignns "$id")
+  read_spawn_record "$rec"
+  idfb=$(make_fake_id_bin "$CASE_DIR")
+  fake_uid=$(( $(id -u) + 104732 ))
+  ns="/tmp/firstmate-tasks-$fake_uid"
+  { [ -e "$ns" ] || [ -L "$ns" ]; } && existed=1
+  [ "$existed" = 0 ] || fail "test namespace $ns already existed; cannot prove foreign-owner refusal"
+  # The real user owns the namespace the fake identity resolves, so it exists
+  # with mode 700 but belongs to a different uid.
+  mkdir -m 700 "$ns" || fail "could not create the foreign namespace fixture $ns"
+  KIMI_RUNTIME_TASK_TMP=$ns
+  out=$(BASE_PATH="$idfb:$BASE_PATH" FM_FAKE_UID="$fake_uid" run_spawn \
+    "$CASE_DIR" "$HOME_DIR" "$PROJ_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$id")
+  rc=$?
+  [ "$rc" -ne 0 ] || fail "a spawn accepted a task temp namespace owned by another uid: $out"
+  assert_contains "$out" "task temp namespace $ns is not a directory owned by this user" \
+    "the spawn did not name the foreign task temp namespace"
+  [ -z "$(ls -A "$ns")" ] || fail "the spawn wrote into a foreign namespace: $(ls -A "$ns")"
+  [ ! -s "$CASE_DIR/launch.log" ] || fail "the spawn launched despite a foreign task temp namespace"
+  [ ! -e "$HOME_DIR/state/$id.meta" ] || fail "the spawn published a task record despite refusing"
+  rmdir "$ns"
+  pass "fm-spawn: a task temp namespace owned by another uid refuses instead of degrading"
 }
 
 test_kimi_hook_install_is_surgical_idempotent_and_removable() {
@@ -1133,6 +1223,8 @@ test_kimi_hook_fails_closed_on_missing_malformed_or_partial_config
 test_kimi_hook_install_refuses_without_jq
 test_kimi_launch_then_send_is_verified
 test_kimi_spawn_refuses_shared_task_temp_root
+test_kimi_spawn_is_not_blocked_by_a_legacy_shared_task_temp_root
+test_kimi_spawn_refuses_a_task_temp_namespace_owned_by_another_uid
 test_kimi_hook_is_silent_and_requires_registered_workspace_token
 test_kimi_spawn_refuses_unsafe_global_config_before_pane_creation
 test_kimi_teardown_removes_pointer_and_registry_token

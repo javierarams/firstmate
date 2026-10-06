@@ -45,7 +45,12 @@ relaunch_cleanup() {
   for d in "${TASK_TMPS[@]:-}"; do
     [ -n "$d" ] && rm -rf "$d"
   done
-  rm -rf "$TMP_ROOT"
+  if [ -f "$TMP_ROOT/task-tmps" ]; then
+    while IFS= read -r d; do
+      [ -n "$d" ] && rm -rf "$d"
+    done < "$TMP_ROOT/task-tmps"
+  fi
+  fm_test_remove_tree "$TMP_ROOT"
 }
 trap relaunch_cleanup EXIT
 
@@ -186,6 +191,7 @@ SH
 new_case() {
   local id=${2:-t1} dir="$TMP_ROOT/$1-$RANDOM"
   mkdir -p "$dir/home/state" "$dir/home/data" "$dir/fake"
+  printf '%s\n' "$(fm_test_task_tmp_root "$id")" >> "$TMP_ROOT/task-tmps"
   : > "$dir/fake/literal"
   : > "$dir/fake/keys"
   printf 'claude' > "$dir/fake/command"
@@ -219,14 +225,13 @@ EOF
     echo "kind=ship"
     echo "mode=no-mistakes"
     echo "yolo=off"
-    echo "tasktmp=/tmp/fm-$id"
+    echo "tasktmp=$(fm_test_task_tmp_root "$id")"
     echo "model=default"
     echo "effort=default"
   } > "$home/state/$id.meta"
   printf '%s\n' "fm-$id" > "$dir/fake/windows"
   printf '%s' "$ses" > "$dir/fake/session-name"
   printf '%s' "$wt" > "$dir/fake/cwd"
-  TASK_TMPS+=("/tmp/fm-$id")
 }
 
 run_control() {  # <case-dir> <args...>
@@ -488,6 +493,53 @@ test_relaunch_preserves_durable_task_metadata() {
   [ "$(meta_field "$dir" rl19 decisions_reviewed)" = 1 ] \
     || fail "the task decision state must survive relaunch"
   pass "fm-control relaunch: durable task metadata survives replacement launch publication"
+}
+
+# A task spawned before the per-user task temp namespace recorded the shared
+# /tmp/fm-<id> root. Its relaunch keeps that root only while it is still this
+# user's private directory; otherwise it moves to the per-user namespace and
+# leaves the legacy path untouched.
+test_relaunch_keeps_a_recorded_legacy_task_temp_root_only_while_private() {
+  local dir out rc id legacy ns_root state
+  for state in private missing shared; do
+    id="rllegacy-$state-$$"
+    legacy="/tmp/fm-$id"
+    ns_root=$(fm_test_task_tmp_root "$id")
+    TASK_TMPS+=("$legacy")
+    rm -rf "$legacy" "$ns_root"
+    dir=$(new_case "legacy-tasktmp-$state" "$id")
+    add_ship_task "$dir" "$id" claude
+    sed -i.bak "s|^tasktmp=.*|tasktmp=$legacy|" "$dir/home/state/$id.meta"
+    rm -f "$dir/home/state/$id.meta.bak"
+    case "$state" in
+      private) mkdir "$legacy"; chmod 755 "$legacy" ;;
+      shared) mkdir "$legacy"; chmod 777 "$legacy" ;;
+    esac
+    rc=0
+    out=$(run_control "$dir" "$id" relaunch --note "resuming after an update") || rc=$?
+    expect_code 0 "$rc" "$state: relaunch of a task with a legacy task temp root should succeed"$'\n'"$out"
+    if [ "$state" = private ]; then
+      [ "$(meta_field "$dir" "$id" tasktmp)" = "$legacy" ] \
+        || fail "$state: relaunch moved a private legacy task temp root: $(meta_field "$dir" "$id" tasktmp)"
+      assert_grep "export GOTMPDIR=$legacy/gotmp" "$dir/fake/keys" \
+        "$state: the replacement pane did not keep the legacy Go temp directory"
+      [ "$(stat -c %a "$legacy" 2>/dev/null || stat -f %Lp "$legacy")" = 700 ] \
+        || fail "$state: relaunch did not tighten the reused legacy task temp root"
+      [ ! -e "$ns_root" ] || fail "$state: relaunch created a second task temp root at $ns_root"
+    else
+      [ "$(meta_field "$dir" "$id" tasktmp)" = "$ns_root" ] \
+        || fail "$state: relaunch did not move to the per-user task temp root: $(meta_field "$dir" "$id" tasktmp)"
+      assert_grep "export GOTMPDIR=$ns_root/gotmp" "$dir/fake/keys" \
+        "$state: the replacement pane did not use the per-user Go temp directory"
+      if [ "$state" = shared ]; then
+        [ "$(stat -c %a "$legacy" 2>/dev/null || stat -f %Lp "$legacy")" = 777 ] \
+          || fail "$state: relaunch changed a legacy task temp root it did not reuse"
+      else
+        [ ! -e "$legacy" ] || fail "$state: relaunch recreated the legacy task temp root"
+      fi
+    fi
+  done
+  pass "fm-control relaunch: a recorded legacy task temp root is kept only while it is this user's private directory"
 }
 
 test_relaunch_serializes_concurrent_durable_metadata_publication() {
@@ -1119,11 +1171,11 @@ test_promoted_scout_relaunch_receives_the_current_delivery_contract() {
       echo "project=$dir/proj"
       echo "harness=claude"
       echo "kind=scout"
-      echo "tasktmp=/tmp/fm-$id"
+      echo "tasktmp=$(fm_test_task_tmp_root "$id")"
       echo "model=default"
       echo "effort=default"
     } > "$home/state/$id.meta"
-    printf '%s\n' "fm-$id" > "$dir/fake/windows"
+      printf '%s\n' "fm-$id" > "$dir/fake/windows"
     printf '%s' "$dir/wt" > "$dir/fake/cwd"
 
     out=$(FM_ROOT_OVERRIDE="$ROOT" FM_HOME="$home" FM_STATE_OVERRIDE="$home/state" \
@@ -2085,7 +2137,7 @@ EOF
     echo "kind=ship"
     echo "mode=no-mistakes"
     echo "yolo=off"
-    echo "tasktmp=/tmp/fm-$id"
+    echo "tasktmp=$(fm_test_task_tmp_root "$id")"
     echo "model=default"
     echo "effort=default"
     echo "backend=herdr"
@@ -2098,14 +2150,10 @@ EOF
   printf '%s' "$survivor" > "$dir/fake/herdr-pane"
   : > "$dir/fake/herdr-log"
   : > "$dir/fake/herdr-stopped"
-  TASK_TMPS+=("/tmp/fm-$id")
 }
 
 # Sets HERDR_CASE_DIR rather than echoing it, so callers invoke it as a plain
-# statement. A `dir=$(herdr_case_or_skip ...)` would run add_herdr_ship_task in
-# a command-substitution subshell, where its TASK_TMPS registration would
-# mutate a discarded copy and the EXIT trap would never remove the
-# out-of-tmproot /tmp/fm-<id> root the spawn creates.
+# statement.
 HERDR_CASE_DIR=
 herdr_case_or_skip() {  # <name> <id> [session] [surviving-pane]
   HERDR_CASE_DIR=
@@ -2391,6 +2439,7 @@ test_relaunch_refuses_before_exit_when_the_composer_holds_pending_text
 test_relaunch_refuses_before_exit_when_the_composer_state_is_unproven
 test_relaunch_from_linked_home_preserves_recorded_worktree
 test_relaunch_preserves_durable_task_metadata
+test_relaunch_keeps_a_recorded_legacy_task_temp_root_only_while_private
 test_relaunch_serializes_concurrent_durable_metadata_publication
 test_disabled_relaunch_clears_prior_trace_context
 test_relaunch_appends_the_progress_note_to_the_instructions
