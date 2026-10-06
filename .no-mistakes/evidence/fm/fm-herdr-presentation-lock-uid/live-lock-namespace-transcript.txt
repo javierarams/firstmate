@@ -1,0 +1,25 @@
+# date: 2026-10-06T00:04:41Z  host user: javieraramberri uid=501  herdr: herdr 0.8.0
+# lab session: fm-lab-lockuid-90393-21844 (provisioned via bin/fm-herdr-lab.sh provision)
+
+## Pre-existing legacy namespace on this machine (other user owns it):
+drwx------  2 502  0  64 Oct  5 16:01 /tmp/firstmate-herdr-presentation
+drwx------  2 javiermux  wheel  64 Oct  5 16:01 /tmp/firstmate-herdr-presentation
+legacy stat (uid mode mtime inode): 502 700 1791226898 69917614
+
+## S1 BASE (70f2ed3) against live lab session: fm_backend_herdr_presentation_session_lock_path
+/tmp/firstmate-herdr-presentation
+rc=1
+
+## S1 HEAD (3923fb2) against same live lab session
+/tmp/firstmate-herdr-presentation-501
+/tmp/firstmate-herdr-presentation-501/order-1ebf6b6277b8a24f5aea7888dc613650.lockrc=0
+drwx------@ 2 501  0  64 Oct  5 20:57 /tmp/firstmate-herdr-presentation-501
+
+## S2 Same user, divergent TMPDIR/env (interactive vs launchd-like vs sandbox) resolves one path
+TMPDIR=/var/folders/n1/7vkblp1d4lj_hc9_t82w28680000gn/T/ -> /tmp/firstmate-herdr-presentation-501/order-1ebf6b6277b8a24f5aea7888dc613650.lock (rc=0)
+TMPDIR=/private/tmp/ -> /tmp/firstmate-herdr-presentation-501/order-1ebf6b6277b8a24f5aea7888dc613650.lock (rc=0)
+TMPDIR=/var/folders/n1/7vkblp1d4lj_hc9_t82w28680000gn/T//fm-base.TcaK1Y/sandbox-tmp/ -> /tmp/firstmate-herdr-presentation-501/order-1ebf6b6277b8a24f5aea7888dc613650.lock (rc=0)
+
+## S4 Legacy directory untouched after HEAD runs
+legacy stat after: 502 700 1791226898 69917614
+UNCHANGED

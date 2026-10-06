@@ -1,0 +1,5 @@
+ok - herdr presentation lock: one path per session/socket across homes
+ok - herdr presentation lock namespace: stable per user and distinct across users
+ok - herdr presentation lock: a namespace owned by another uid refuses instead of degrading
+ok - herdr presentation lock: null and missing socket paths fail closed
+exit=0

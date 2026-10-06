@@ -1,0 +1,24 @@
+# S3 adversarial: namespace that does not validate refuses (live lab session fm-lab-lockuid-90393-21844, HEAD 3923fb2)
+## S3a: two identities resolve distinct namespaces (identity simulated via PATH id -u shim)
+uid 501 -> /tmp/firstmate-herdr-presentation-501
+uid 502 -> /tmp/firstmate-herdr-presentation-502
+
+## S3b: victim uid 205230; attacker (real uid 501) pre-creates /tmp/firstmate-herdr-presentation-205230 mode 700
+drwx------@ 2 501  0  64 Oct  5 21:05 /tmp/firstmate-herdr-presentation-205230
+rc=1 path=[]
+lock files created in foreign ns: 0
+
+## S3c: victim namespace is a symlink to a dir owned by victim-identity? (symlink planted)
+lrwxr-xr-x@ 1 501  0  71 Oct  5 21:05 /tmp/firstmate-herdr-presentation-205230 -> /var/folders/n1/7vkblp1d4lj_hc9_t82w28680000gn/T//fm-base.TcaK1Y/target
+rc=1 path=[]
+
+## S3d: non-numeric id -u output refuses before creating anything in /tmp
+uid=[] rc=1 path=[]
+  /tmp namespaces unchanged: /tmp/firstmate-herdr-presentation /tmp/firstmate-herdr-presentation-501 
+uid=[abc] rc=1 path=[]
+  /tmp namespaces unchanged: /tmp/firstmate-herdr-presentation /tmp/firstmate-herdr-presentation-501 
+uid=[501x] rc=1 path=[]
+  /tmp namespaces unchanged: /tmp/firstmate-herdr-presentation /tmp/firstmate-herdr-presentation-501 
+
+## S3e: real user still resolves normally after adversarial runs
+rc=0 path=[/tmp/firstmate-herdr-presentation-501/order-1ebf6b6277b8a24f5aea7888dc613650.lock]
