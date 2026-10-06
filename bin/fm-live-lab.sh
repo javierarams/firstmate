@@ -54,8 +54,8 @@
 #                    .pi/extensions loads; sessions stay under
 #                    <lab-root>/pi-sessions.
 #   task ids         lab<nonce>-mate and lab<nonce>-worker, unique per lab,
-#                    because a spawn keeps a task temp dir at /tmp/fm-<id>
-#                    that a fixed id would share with other labs and tasks.
+#                    because a spawn keeps a per-id task temp dir that a fixed
+#                    id would share with other labs and tasks.
 #   mate/            --mate: bin/fm-home-seed.sh <mate-id> <lab-root>/mate
 #                    --no-projects (an explicit path cloned from the git lab
 #                    home), launched by bin/fm-spawn.sh --secondmate.
@@ -116,6 +116,8 @@ RECORD_NAME=.fm-live-lab
 RECORD_TOKEN='fm-live-lab v1'
 PI_TRUST_STORE="$HOME/.pi/agent/trust.json"
 TREEHOUSE_DIR="$HOME/.treehouse"
+# shellcheck source=bin/fm-user-tmp-lib.sh
+. "$SCRIPT_DIR/fm-user-tmp-lib.sh"
 
 die() { echo "fm-live-lab: $*" >&2; exit 1; }
 help_text() { sed -n '/^# Usage:/,/^# up builds/p' "${BASH_SOURCE[0]}" | sed '$d' | sed 's/^# \{0,1\}//'; }
@@ -789,18 +791,21 @@ cmd_down() {
     die "refusing to remove the lab: its processes did not exit (pid ppid pgid state command): $details"
   fi
   echo "stopped: lab tmux server and lab processes"
-  # A spawn keeps /tmp/fm-<id> and /tmp/fm-<id>+<sha256 of the spawning home>.
-  # The second is scoped to this lab home for any task it spawned; the first is
-  # removed only for the lab's own unique ids, since another home may share it.
+  # A spawn keeps <this user's task temp namespace>/<id> (/tmp/fm-<id> before
+  # that namespace) and /tmp/fm-<id>+<sha256 of the spawning home>.
+  # The last is scoped to this lab home for any task it spawned; the task temp
+  # root is removed only for the lab's own unique ids, since another home may
+  # share it.
   home_hash=$(printf '%s' "$LAB" | shasum -a 256 | awk '{print $1}')
+  task_tmp_ns=$(fm_user_tmp_namespace firstmate-tasks) || task_tmp_ns=
   ids=("$MATE_ID" "$WORKER_ID")
   for meta in "$LAB"/state/*.meta; do
     [ -f "$meta" ] && ids+=("$(basename "$meta" .meta)")
   done
   for id in "${ids[@]}"; do
     [ -n "$id" ] || continue
-    for dir in "/tmp/fm-$id+$home_hash" "/tmp/fm-$id"; do
-      [ "$dir" != "/tmp/fm-$id" ] || [ "$id" = "$MATE_ID" ] || [ "$id" = "$WORKER_ID" ] || continue
+    for dir in "/tmp/fm-$id+$home_hash" "/tmp/fm-$id" ${task_tmp_ns:+"$task_tmp_ns/$id"}; do
+      [ "$dir" = "/tmp/fm-$id+$home_hash" ] || [ "$id" = "$MATE_ID" ] || [ "$id" = "$WORKER_ID" ] || continue
       if [ -d "$dir" ] && [ ! -L "$dir" ] && [ -O "$dir" ]; then
         rm -rf "$dir" && echo "removed: task temp $dir"
       fi

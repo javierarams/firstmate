@@ -16,6 +16,7 @@ TMP_ROOT=$(fm_test_tmproot fm-live-lab)
 : > "$TMP_ROOT/tmux-dirs"
 LIVE_LAB="$ROOT/bin/fm-live-lab.sh"
 TRUST="$ROOT/bin/fm-claude-trust.sh"
+TASK_TMP_NS=$(dirname "$(fm_test_task_tmp_root probe)")
 
 live_lab_cleanup() {
   local dir pid marker
@@ -29,6 +30,7 @@ live_lab_cleanup() {
     case "$dir" in /tmp/fml.*) rm -rf "$dir" ;; esac
   done < "$TMP_ROOT/tmux-dirs"
   rm -rf "/tmp/fm-labt$$-mate" "/tmp/fm-labt$$-worker" "/tmp/fm-labt$$-other" /tmp/fm-labt"$$"-*+*
+  rm -rf "$TASK_TMP_NS/labt$$-mate" "$TASK_TMP_NS/labt$$-worker" "$TASK_TMP_NS/labt$$-other"
   fm_test_cleanup
 }
 trap live_lab_cleanup EXIT
@@ -336,7 +338,8 @@ pass "down refuses anything up did not build"
 C_HASH=$(printf '%s' "$CH" | shasum -a 256 | awk '{print $1}')
 OTHER_ID="labt$$-other"
 fm_write_meta "$CH/state/$OTHER_ID.meta" "window=firstmate:fm-$OTHER_ID" "tasktmp=/tmp/fm-$OTHER_ID"
-mkdir -p "/tmp/fm-$WORKER_ID/gotmp" "/tmp/fm-$MATE_ID" "/tmp/fm-$WORKER_ID+$C_HASH" "/tmp/fm-$OTHER_ID+$C_HASH" "/tmp/fm-$OTHER_ID"
+mkdir -p "/tmp/fm-$WORKER_ID/gotmp" "/tmp/fm-$MATE_ID" "/tmp/fm-$WORKER_ID+$C_HASH" "/tmp/fm-$OTHER_ID+$C_HASH" "/tmp/fm-$OTHER_ID" \
+  "$(fm_test_task_tmp_root "$WORKER_ID")/gotmp" "$(fm_test_task_tmp_root "$MATE_ID")" "$(fm_test_task_tmp_root "$OTHER_ID")"
 # An outsider opening a lab path is not owned by the lab.
 printf 'sleep 600\n' > "$C/stray.sh"
 bash "$C/stray.sh" >/dev/null 2>&1 &
@@ -379,6 +382,9 @@ assert_absent "/tmp/fm-$MATE_ID" "down removes the mate's task temp dir"
 assert_absent "/tmp/fm-$WORKER_ID+$C_HASH" "down removes the worker's launch dir"
 assert_absent "/tmp/fm-$OTHER_ID+$C_HASH" "down removes a lab-spawned task's launch dir scoped to the lab home"
 assert_present "/tmp/fm-$OTHER_ID" "down keeps a task temp dir another home could share"
+assert_absent "$TASK_TMP_NS/$WORKER_ID" "down removes the worker's per-user task temp dir"
+assert_absent "$TASK_TMP_NS/$MATE_ID" "down removes the mate's per-user task temp dir"
+assert_present "$TASK_TMP_NS/$OTHER_ID" "down keeps a per-user task temp dir another home could share"
 kept=$(node -e 'const j=JSON.parse(require("node:fs").readFileSync(process.argv[1],"utf8"));console.log(JSON.stringify([j.keep,Object.keys(j.projects).sort()]))' "$HOME/.claude.json")
 assert_equals '[1,["/elsewhere/project"]]' "$kept" "down removes exactly the lab's Claude project entries"
 assert_contains "$out" "removed: 2 Claude project entries" "down reports the removed entries"
