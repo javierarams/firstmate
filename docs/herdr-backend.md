@@ -282,7 +282,7 @@ Projected children are placed in one contiguous block immediately after their ow
 - The protocol.
 - The socket.
 - `python3`.
-- The machine-private per-session lock.
+- The user-private per-session lock.
 
 Existing legacy child labels may extend an already adjacent block read-only but are never renamed or migrated.
 A foreign, ambiguous, detached, or manually interleaved child makes ordering skip with a warning rather than rewriting the layout.
@@ -342,6 +342,11 @@ Ordinary non-projected task removal:
 - Applies the same focus-safe plan when its close would empty a non-focused workspace.
 - Keeps the legitimate plain close when the target is the active tab.
 - Refuses an unlocked close if the lock cannot be acquired.
+
+Each session lock lives in a namespace directory private to the running user.
+It must be owned by that uid with mode 700, and any other shape refuses the lock rather than degrading to an unlocked path.
+So two users on one machine never contend for the same lock, while every Firstmate home of one user still shares it.
+Releases before the per-user namespace used one shared `/tmp/firstmate-herdr-presentation` directory, which Firstmate no longer reads or removes; its owner may delete it by hand.
 
 Task cleanup acquires that session lock before the task's isolated copy is returned.
 So a contended lock refuses up front while the copy, every durable record, and the endpoint are all intact for a plain rerun.

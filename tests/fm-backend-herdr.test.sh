@@ -3382,8 +3382,8 @@ test_presentation_session_lock_path_is_shared_across_homes() {
     || fail "session lock path resolution failed for home B"
   [ "$path_a" = "$path_b" ] || fail "same session/socket must resolve one shared lock path"
   case "$path_a" in
-    /tmp/firstmate-herdr-presentation/order-*.lock) ;;
-    *) fail "session lock path must use the shared machine namespace: $path_a" ;;
+    "/tmp/firstmate-herdr-presentation-$(id -u)/order-"*.lock) ;;
+    *) fail "session lock path must use this user's shared namespace: $path_a" ;;
   esac
   case "$path_a" in
     */state/*) fail "session lock path must not live under a home state directory: $path_a" ;;
@@ -3408,6 +3408,81 @@ test_presentation_session_lock_path_is_shared_across_homes() {
       || fail "symlink parent socket paths must resolve one lock: $path_tmp vs $path_private"
   fi
   pass "herdr presentation lock: one path per session/socket across homes"
+}
+
+make_fake_id_bin() {  # <dir> -> echoes fakebin dir whose `id -u` prints $FM_FAKE_UID
+  local fb="$1/fake-id-bin"
+  mkdir -p "$fb"
+  cat > "$fb/id" <<'SH'
+#!/usr/bin/env bash
+if [ "$#" -eq 1 ] && [ "$1" = -u ]; then
+  printf '%s\n' "$FM_FAKE_UID"
+  exit 0
+fi
+exec /usr/bin/id "$@"
+SH
+  chmod +x "$fb/id"
+  printf '%s' "$fb"
+}
+
+test_presentation_lock_namespace_is_per_user() {
+  local dir fb real_uid uid_a uid_b ns_a ns_a_again ns_b ns_bad status
+  dir="$TMP_ROOT/presentation-namespace-per-user"; mkdir -p "$dir"
+  fb=$(make_fake_id_bin "$dir")
+  real_uid=$(id -u)
+  uid_a=$((real_uid + 104729))
+  uid_b=$((real_uid + 104730))
+  ns_a=$(PATH="$fb:$PATH" FM_FAKE_UID="$uid_a" \
+    bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_presentation_lock_namespace' "$ROOT") \
+    || fail "namespace resolution failed for uid $uid_a"
+  ns_a_again=$(PATH="$fb:$PATH" FM_FAKE_UID="$uid_a" \
+    bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_presentation_lock_namespace' "$ROOT") \
+    || fail "second namespace resolution failed for uid $uid_a"
+  ns_b=$(PATH="$fb:$PATH" FM_FAKE_UID="$uid_b" \
+    bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_presentation_lock_namespace' "$ROOT") \
+    || fail "namespace resolution failed for uid $uid_b"
+  [ -n "$ns_a" ] && [ -n "$ns_b" ] || fail "namespace resolution printed an empty path"
+  [ "$ns_a" = "$ns_a_again" ] || fail "one user resolved two namespaces: $ns_a vs $ns_a_again"
+  [ "$ns_a" != "$ns_b" ] || fail "two users resolved one shared namespace: $ns_a"
+  for ns_bad in "$ns_a" "$ns_b"; do
+    [ "$ns_bad" != /tmp/firstmate-herdr-presentation ] \
+      || fail "namespace still resolves the user-agnostic legacy path"
+  done
+  for uid_b in "" abc "501x"; do
+    ns_bad=$(PATH="$fb:$PATH" FM_FAKE_UID="$uid_b" \
+      bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_presentation_lock_namespace' "$ROOT" 2>&1)
+    status=$?
+    [ "$status" -ne 0 ] || fail "non-numeric uid '$uid_b' resolved a namespace: $ns_bad"
+    [ -z "$ns_bad" ] || fail "non-numeric uid '$uid_b' printed a namespace: $ns_bad"
+  done
+  pass "herdr presentation lock namespace: stable per user and distinct across users"
+}
+
+test_presentation_session_lock_path_refuses_foreign_namespace() {
+  local dir log resp fb idfb fake_uid ns path status existed=0
+  dir="$TMP_ROOT/presentation-foreign-namespace"; mkdir -p "$dir/responses" "$dir/sockdir"
+  log="$dir/log"; resp="$dir/responses"; : > "$log"
+  : > "$dir/sockdir/fmtest.sock"
+  printf '%s\n' "{\"sessions\":[{\"name\":\"fmtest\",\"running\":true,\"socket_path\":\"$dir/sockdir/fmtest.sock\"}]}" > "$resp/1.out"
+  fb=$(make_herdr_fakebin "$dir")
+  idfb=$(make_fake_id_bin "$dir")
+  fake_uid=$(( $(id -u) + 104731 ))
+  ns="/tmp/firstmate-herdr-presentation-$fake_uid"
+  { [ -e "$ns" ] || [ -L "$ns" ]; } && existed=1
+  # The real user creates the namespace that the fake identity resolves, so the
+  # directory exists with mode 700 but is owned by a different uid.
+  path=$(PATH="$idfb:$fb:$PATH" FM_FAKE_UID="$fake_uid" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" \
+    bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_presentation_session_lock_path fmtest' "$ROOT" 2>&1)
+  status=$?
+  if [ "$existed" = 0 ] && [ -d "$ns" ] && [ ! -L "$ns" ] && [ -O "$ns" ]; then
+    find "$ns" -mindepth 1 -maxdepth 1 -name 'order-*.lock' -print | grep . >/dev/null \
+      && fail "foreign namespace received a lock file"
+    rmdir "$ns" 2>/dev/null || true
+  fi
+  [ "$existed" = 0 ] || fail "test namespace $ns already existed; cannot prove foreign-owner refusal"
+  [ "$status" -ne 0 ] || fail "namespace owned by another uid must refuse the lock path: $path"
+  [ -z "$path" ] || fail "namespace owned by another uid returned a lock path: $path"
+  pass "herdr presentation lock: a namespace owned by another uid refuses instead of degrading"
 }
 
 test_presentation_session_lock_path_rejects_malformed_socket() {
@@ -5902,6 +5977,8 @@ test_projection_order_anchors_the_parent_by_exact_id
 test_projection_order_foreign_new_child_before_parent_is_read_only
 test_projection_order_missing_parent_is_read_only
 test_presentation_session_lock_path_is_shared_across_homes
+test_presentation_lock_namespace_is_per_user
+test_presentation_session_lock_path_refuses_foreign_namespace
 test_presentation_session_lock_path_rejects_malformed_socket
 test_projection_order_rejects_malformed_socket
 test_projection_reclaim_refusal_matrix_is_non_mutating
