@@ -909,11 +909,12 @@ Directories signed in to the same email are one account for rotation, because th
 When a Claude ship or scout stops at its usage limit, the watcher notices either from Claude's own API-error record for that worker or from a usage-limit line on its idle pane, and the rotation then acts without waiting for a conversational turn:
 
 - It first checks the whole pool: an entry whose account email is missing or not on the allowlist stops all rotation for the home and is reported once as a blocker, and nothing launches on the pool until `config/claude-account` and the allowlist agree again.
-- It confirms the limit with a minimal live turn on the worker's own recorded account and model; an account that still answers is not limited, so nothing moves and ordinary supervision continues.
-  A worker recorded on an account the allowlist does not list is reported once by email and never relaunched, and a worker with no recorded, readable account is relaunched only on Claude's own API-error record, never on a pane line alone.
+- It confirms the limit with a minimal live turn on the worker's own recorded account and model, and only that turn's rejection licenses a relaunch; an account that still answers is not limited, so nothing moves and ordinary supervision continues.
+  A worker recorded on an account the allowlist does not list is reported once by email and never relaunched, and a worker with no recorded, readable account, or whose live turn fails, is reported once as unconfirmed and never relaunched, whatever its pane or API-error record shows.
 - It walks the pool from the current selection, skipping accounts known to be limited, and takes the first that passes the sign-in check and a live turn of its own.
   It records that account as the selection, so new spawns use it too, and relaunches the worker on it with its local copy, instructions, model, and effort preserved and its account recorded in the task record.
-- When no account is usable it keeps the worker where it is, declares a wait in the worker's status log until the earliest known reset, and retries then if the worker has not taken a turn since its latest stop at the limit, by its busy record, or its idle pane still shows the limit; a worker that took a turn meanwhile without stopping at the limit again is left alone and the wait is resolved.
+- When no account is usable it keeps the worker where it is, declares a wait in the worker's status log until the earliest known reset, and retries then only if the worker is still stopped.
+  A worker that supervision sees busy, whose busy record shows a turn since its latest stop at the limit, or, without an idle busy record, whose pane changed, has resumed on its own: it is left alone and the wait is resolved, even when an old limit line is still on its pane.
 
 Each episode surfaces as one supervision notification: the rotation, the wait, a blocker, or a relaunch that could not complete.
 A secondmate agent is never rotated; it takes the current selection at its next launch.

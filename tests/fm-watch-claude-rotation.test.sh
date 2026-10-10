@@ -130,6 +130,7 @@ test_absorb_verdict_skips_stale_triage() {
   [ "$(grep -c ' observe rot' "$DIR/rotate.log")" -ge 2 ] || fail "an absorbed window should be re-observed every poll: $(cat "$DIR/rotate.log")"
   assert_grep "absorbed claude usage limit for rot: waiting for a Claude usage reset" "$STATE/.watch-triage.log" \
     "the absorb should be logged"
+  assert_no_grep "window-busy" "$DIR/rotate.log" "an idle window must not be observed as busy"
   pass "an absorb verdict keeps a limited worker out of ordinary stale triage and is re-observed each poll"
 }
 
@@ -201,6 +202,22 @@ test_only_stable_claude_ships_reach_the_rotation() {
   pass "only a stable limit pane of a Claude ship or scout in a home with a pool reaches the rotation"
 }
 
+test_observation_carries_the_window_busy_classification() {
+  local out
+  rotation_case busy claude
+  printf 'Working on the tests.\n' > "$PANE"
+  printf 'g1\n' > "$STATE/rot.busy-gen"
+  printf 'v1 gen=g1 seq=3 state=busy source=claude-hook event=user-prompt-submit ts=%s\n' "$(date +%s)" > "$STATE/rot.busy-state"
+  : > "$STATE/.claude-limit-absorb-$KEY"
+  out="$DIR/watch.out"
+  watch_run "$out" FM_TEST_ROTATE_VERDICT="absorb	waiting for a Claude usage reset"
+  wait_captures 2 || fail "an absorbed window should keep the watcher polling: $(cat "$out")"
+  stop_watch
+  assert_contains "$(head -n 1 "$DIR/rotate.log")" "observe rot --pane-hash $(hash_text "$(cat "$PANE")") --window-busy" \
+    "a window the watcher classifies busy should be observed as busy, so a waiting rotation leaves the resumed worker alone"
+  pass "every observation carries the current pane hash and the window's busy classification"
+}
+
 test_stop_failure_record_reaches_the_rotation_without_a_pane_line() {
   local out
   rotation_case stop-failure claude
@@ -209,7 +226,8 @@ test_stop_failure_record_reaches_the_rotation_without_a_pane_line() {
   out="$DIR/watch.out"
   watch_run "$out" FM_TEST_ROTATE_VERDICT="wake	check: claude account rotated: rot"
   wait_exit "$WPID" || { stop_watch; fail "a StopFailure record should reach the rotation"; }
-  assert_equals "captures=1 observe rot" "$(head -n 1 "$DIR/rotate.log")" "a StopFailure record is observed without pane evidence"
+  assert_equals "captures=1 observe rot --pane-hash $(hash_text "$(cat "$PANE")")" "$(head -n 1 "$DIR/rotate.log")" \
+    "a StopFailure record is observed with the current pane hash and no pane line"
   pass "a StopFailure record reaches the rotation even when the pane shows no limit line"
 }
 
@@ -241,6 +259,7 @@ test_wake_verdict_is_queued_and_surfaced
 test_absorb_verdict_skips_stale_triage
 test_pass_verdict_falls_through_once
 test_only_stable_claude_ships_reach_the_rotation
+test_observation_carries_the_window_busy_classification
 test_stop_failure_record_reaches_the_rotation_without_a_pane_line
 test_validation_scan_wakes_once_per_report
 

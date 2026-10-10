@@ -364,6 +364,79 @@ test_expired_wait_leaves_a_resumed_worker_alone() {
   pass "an expired wait whose worker took a turn since ends without relaunching it"
 }
 
+expire_wait() {
+  sed -i.bak 's/^until=.*/until=1000/' "$STATE/claude-account-rotation/episode-$ID" && rm -f "$STATE/claude-account-rotation/episode-$ID.bak"
+}
+
+assert_wait_ended_untouched() {  # <out> <msg>
+  assert_equals pass "${1%%$'\t'*}" "$2: the expired wait must pass the worker back: $1"
+  assert_not_relaunched "$2"
+  assert_equals 2 "$(probe_count)" "$2: a resumed worker must not be probed again"
+  assert_contains "$(tail -n 1 "$STATE/$ID.status")" "resolved [key=claude-usage-limit] [at=" "$2: ending the wait should resolve the declared pause"
+}
+
+test_expired_wait_ignores_an_old_limit_line_on_a_resumed_worker() {
+  local out
+  new_case old-line
+  wait_on_stop_failure
+  busy_record 5 idle
+  out=$(observe_pane h9)
+  assert_wait_ended_untouched "$out" "a worker that took a turn while its old limit line is still on its pane"
+  assert_contains "$out" "the worker took a turn since it stopped at the Claude usage limit" "the pass should say why"
+  out=$(observe_pane h9)
+  assert_equals pass "${out%%$'\t'*}" "the same old limit line must stay quiet: $out"
+  assert_equals 2 "$(probe_count)" "the same old limit line must not be probed again"
+
+  new_case old-line-during-wait
+  wait_on_stop_failure
+  sed -i.bak 's/^until=.*/until=1900000000/' "$STATE/claude-account-rotation/episode-$ID" && rm -f "$STATE/claude-account-rotation/episode-$ID.bak"
+  busy_record 5 busy
+  busy_record 6 idle
+  out=$(observe_pane h9)
+  assert_equals absorb "${out%%$'\t'*}" "a limit line seen during the wait keeps the wait: $out"
+  out=$(observe_pane h9)
+  assert_equals absorb "${out%%$'\t'*}" "a limit line seen again during the wait keeps the wait: $out"
+  expire_wait
+  out=$(observe_pane h9)
+  assert_wait_ended_untouched "$out" "a limit line seen during the wait is no new stop"
+  pass "an expired wait leaves alone a worker that took a turn, even while an old limit line is on its pane"
+}
+
+test_expired_wait_leaves_a_busy_window_alone() {
+  local out
+  new_case window-busy
+  wait_on_stop_failure
+  out=$(rotate observe "$ID" --pane-hash h1 --window-busy)
+  assert_wait_ended_untouched "$out" "a worker the watcher sees busy"
+  assert_contains "$out" "the worker is busy again" "the pass should say why"
+  pass "an expired wait leaves alone a worker the watcher classifies busy"
+}
+
+test_expired_wait_without_busy_record_reads_the_pane() {
+  local out
+  new_case pane-changed
+  printf 'rejected 1900000600\n' > "$CASE/a/probe"
+  printf 'rejected 1900000000\n' > "$CASE/b/probe"
+  out=$(observe_pane h1)
+  assert_equals wake "${out%%$'\t'*}" "the first sight should surface the wait: $out"
+  printf 'allowed\n' > "$CASE/a/probe"
+  printf 'allowed\n' > "$CASE/b/probe"
+  printf 'a@example.com\t1000\t900\nb@example.com\t1000\t900\n' > "$STATE/claude-account-rotation/limited"
+  expire_wait
+  out=$(rotate observe "$ID" --pane-hash h2)
+  assert_wait_ended_untouched "$out" "a worker with no busy record whose pane changed"
+  assert_contains "$out" "the worker's pane changed since it stopped at the Claude usage limit" "the pass should say why"
+
+  new_case pane-unknown
+  printf 'rejected 1900000600\n' > "$CASE/a/probe"
+  printf 'rejected 1900000000\n' > "$CASE/b/probe"
+  out=$(observe_pane h1)
+  expire_wait
+  out=$(rotate observe "$ID")
+  assert_wait_ended_untouched "$out" "a worker with no busy record and no pane to compare"
+  pass "without a busy record an expired wait relaunches only a worker whose pane is unchanged"
+}
+
 test_unprobeable_own_account_needs_the_service_verdict() {
   local out
   new_case unrecorded
@@ -381,8 +454,12 @@ test_unprobeable_own_account_needs_the_service_verdict() {
   sed -i.bak '/^account=/d' "$STATE/$ID.meta" && rm -f "$STATE/$ID.meta.bak"
   printf '{"error":"rate_limit","last_assistant_message":"API Error"}\n' | "$ROTATE" record-stop-failure "$STATE" "$ID" --gen gen-1
   out=$(rotate observe "$ID")
-  assert_equals wake "${out%%$'\t'*}" "Claude's own rate_limit record confirms the limit: $out"
-  assert_equals "$CASE/a" "$(meta_field account)" "the confirmed limit should relaunch on the first usable account"
+  assert_equals wake "${out%%$'\t'*}" "a rate_limit record with no account to probe should surface: $out"
+  assert_contains "$out" "check: claude usage limit unconfirmed for $ID: Claude reported a rate_limit API error ('API Error') but its account is not recorded or readable, so no live probe could confirm the limit" \
+    "the wake should say no live probe confirmed the limit"
+  assert_equals "" "$(meta_field account)" "an unconfirmed rate_limit record must not relaunch the worker"
+  assert_no_grep "Firstmate operational input waiting" "$CASE/fake/literal" "no replacement may launch without a confirming probe"
+  assert_equals 0 "$(probe_count)" "nothing could be probed for an unrecorded account"
 
   new_case disallowed-own
   claude_root "$CASE/x" intruder@example.org
@@ -393,7 +470,7 @@ test_unprobeable_own_account_needs_the_service_verdict() {
   assert_equals "$CASE/x" "$(meta_field account)" "the task record must keep its account"
   assert_no_grep "Firstmate operational input waiting" "$CASE/fake/literal" "a disallowed account's worker must not be relaunched"
   assert_equals 0 "$(probe_count)" "a disallowed account must never be probed"
-  pass "without a probeable allowed own account, a pane line alone never relaunches and a disallowed account is named"
+  pass "without a probeable allowed own account nothing relaunches, whatever the pane or API-error record shows, and a disallowed account is named"
 }
 
 test_same_email_directories_are_one_account() {
@@ -488,7 +565,14 @@ test_stop_failure_record_is_structural_evidence() {
   assert_equals "$CASE/b" "$(meta_field account)" "the StopFailure-evidenced rotation should relaunch on the next account"
   printf 'not json' | "$ROTATE" record-stop-failure "$STATE" ../escape --gen x
   expect_code 0 $? "the hook must never fail Claude's lifecycle"
-  pass "a StopFailure rate_limit record of the current agent is evidence on its own, and a stale or unrelated one is not"
+
+  new_case stop-failure-allowed
+  printf '{"error":"rate_limit","last_assistant_message":"API Error"}\n' | "$ROTATE" record-stop-failure "$STATE" "$ID" --gen gen-1
+  out=$(rotate observe "$ID")
+  assert_equals pass "${out%%$'\t'*}" "a rate_limit record the live probe does not confirm must not rotate: $out"
+  assert_not_relaunched "an unconfirmed rate_limit record"
+  assert_equals "$CASE/a opus" "$(cat "$CASE/probes")" "the record should be checked against the worker's own account first"
+  pass "a StopFailure rate_limit record of the current agent triggers the probe, which alone decides, and a stale or unrelated one is not evidence"
 }
 
 test_default_model_probes_with_the_root_settings_model() {
@@ -615,6 +699,9 @@ test_expired_wait_resumes_and_resolves_the_pause
 test_expired_wait_retries_a_worker_still_stopped
 test_expired_wait_retries_a_worker_limited_again_during_the_wait
 test_expired_wait_leaves_a_resumed_worker_alone
+test_expired_wait_ignores_an_old_limit_line_on_a_resumed_worker
+test_expired_wait_leaves_a_busy_window_alone
+test_expired_wait_without_busy_record_reads_the_pane
 test_unprobeable_own_account_needs_the_service_verdict
 test_same_email_directories_are_one_account
 test_signed_out_and_unprobeable_accounts_are_skipped

@@ -5,7 +5,7 @@
 # Usage: fm-claude-account-rotate.sh status
 #        fm-claude-account-rotate.sh select <entry>
 #        fm-claude-account-rotate.sh probe <entry> [--model <model>]
-#        fm-claude-account-rotate.sh observe <task-id> [--pane-hash <hash>] [--pane-line <text>]
+#        fm-claude-account-rotate.sh observe <task-id> [--pane-hash <hash>] [--pane-line <text>] [--window-busy]
 #        fm-claude-account-rotate.sh validation-scan
 #        fm-claude-account-rotate.sh record-stop-failure <state-dir> <task-id> --gen <gen>
 #
@@ -39,8 +39,12 @@
 #                usage limit (bin/fm-watch.sh owns the evidence read). The
 #                evidence is either the task's StopFailure record (below) with
 #                error rate_limit for the current agent incarnation, or the
-#                stable pane hash plus the limit line the watcher matched with
-#                fm_worker_account_claude_limit_line. Prints exactly one line:
+#                limit line the watcher matched with
+#                fm_worker_account_claude_limit_line on a stable pane, passed as
+#                --pane-line. --pane-hash is the window's current pane hash and
+#                --window-busy says the watcher classifies the window busy;
+#                both feed the resumed-worker check in step 5. Prints exactly
+#                one line:
 #                  wake<TAB><check reason>  the watcher queues and surfaces it
 #                  absorb<TAB><why>         handled; skip ordinary stale triage
 #                  pass<TAB><why>           not ours; ordinary triage continues
@@ -54,16 +58,15 @@
 #                   per distinct reason) and launches nothing; the next
 #                   episode or retry after the pool is fixed clears it.
 #                2. Confirms the limit by probing the task's own recorded
-#                   account (account= in its record) with the task's model. An
+#                   account (account= in its record) with the task's model.
+#                   Only a rejected probe confirms it: no evidence, pane line
+#                   or StopFailure record, relaunches anything on its own. An
 #                   allowed answer is no limit: the evidence is dismissed and
-#                   ordinary triage continues, except when this episode was
-#                   already waiting on a reset, which is then over. A failed
-#                   probe surfaces once as unconfirmed and acts on nothing.
-#                   A recorded account whose email the allowlist does not list
-#                   surfaces once naming it and acts on nothing. Without a
-#                   recorded, readable account only a StopFailure record
-#                   confirms the limit; pane evidence alone surfaces once as
-#                   unconfirmed and acts on nothing.
+#                   ordinary triage continues. A failed probe, or a task with
+#                   no recorded, readable account to probe, surfaces once as
+#                   unconfirmed and acts on nothing. A recorded account whose
+#                   email the allowlist does not list surfaces once naming it
+#                   and acts on nothing.
 #                3. Records every rejected account email with its reset in
 #                   state/claude-account-rotation/limited. Directories signed
 #                   in to one email are one account: one limited email skips
@@ -82,14 +85,19 @@
 #                   renewed only when the time changes - until the earliest
 #                   known reset (FM_CLAUDE_ROTATE_UNKNOWN_RESET_SECS after the
 #                   observation when an account reported none), then retries.
-#                   The wait records the task's busy record (seq and state,
-#                   bin/fm-busy-lib.sh), refreshed with the evidence whenever
-#                   the worker stops at the limit again during the wait; the
-#                   retry needs a fresh pane limit
-#                   line or that record still idle at the same seq, and a
-#                   worker that took a turn meanwhile ends the wait with
-#                   nothing relaunched. Either end appends the matching
-#                   `resolved` line.
+#                   The wait snapshots the worker's busy record (seq and state,
+#                   bin/fm-busy-lib.sh) and pane hash, and only a new
+#                   StopFailure record during the wait - the worker stopped at
+#                   the limit again - refreshes that snapshot. At expiry a
+#                   worker the watcher classifies busy, whose busy record says
+#                   busy or moved since the snapshot, or, with no idle busy
+#                   record, whose pane changed, has resumed: the wait ends with
+#                   nothing relaunched, even when an old limit line is still on
+#                   its pane. A worker still stopped goes on: the probe of its
+#                   own account only updates the limited ledger, since the
+#                   wait already confirmed the limit, and steps 3 to 5 relaunch
+#                   it on the first usable account or wait again. Either end
+#                   appends the matching `resolved` line.
 #                A failed relaunch or an unconfirmed limit surfaces once and
 #                then passes the window back to ordinary stale triage for the
 #                rest of that incarnation; a block is retried every
@@ -453,10 +461,10 @@ block_clear() {
 
 # --- episodes -----------------------------------------------------------------
 
-EP_GEN='' EP_OUTCOME='' EP_EVIDENCE='' EP_UNTIL='' EP_DECLARED='' EP_BUSY=''
+EP_GEN='' EP_OUTCOME='' EP_EVIDENCE='' EP_UNTIL='' EP_DECLARED='' EP_BUSY='' EP_PANE=''
 episode_read() {  # <task>
   local line
-  EP_GEN='' EP_OUTCOME='' EP_EVIDENCE='' EP_UNTIL='' EP_DECLARED='' EP_BUSY=''
+  EP_GEN='' EP_OUTCOME='' EP_EVIDENCE='' EP_UNTIL='' EP_DECLARED='' EP_BUSY='' EP_PANE=''
   [ -f "$R/episode-$1" ] || return 1
   while IFS= read -r line || [ -n "$line" ]; do
     case "$line" in
@@ -466,19 +474,21 @@ episode_read() {  # <task>
     until=*) EP_UNTIL=${line#until=} ;;
     declared=*) EP_DECLARED=${line#declared=} ;;
     busy=*) EP_BUSY=${line#busy=} ;;
+    pane=*) EP_PANE=${line#pane=} ;;
     esac
   done < "$R/episode-$1"
   case "$EP_UNTIL" in '' | *[!0-9]*) EP_UNTIL=0 ;; esac
   return 0
 }
 
-episode_write() {  # <task> <gen> <outcome> <evidence> <until> [declared] [busy]
+episode_write() {  # <task> <gen> <outcome> <evidence> <until> [declared] [busy] [pane]
   write_file "$R/episode-$1" "gen=$2
 outcome=$3
 evidence=$4
 until=$5
 declared=${6:-}
 busy=${7:-}
+pane=${8:-}
 "
 }
 
@@ -487,6 +497,49 @@ busy_mark() {  # <task> -> "<seq> <state>" of the task's busy record, or empty
   rec=$(fm_busy_record_read "$STATE" "$1") || return 0
   read -r state _ _ seq <<< "$rec"
   printf '%s %s\n' "$seq" "$state"
+}
+
+# worker_resumed <task> <pane-hash> <window-busy>
+# Returns 0, with WHY naming the sign, when anything shows the worker active
+# since the waiting episode's snapshot (EP_BUSY, EP_PANE); returns 1 only when
+# it is provably still stopped: its busy record is idle and unchanged, or,
+# without an idle record, its record is unchanged and its pane hash is too.
+WHY=
+worker_resumed() {
+  local cur
+  WHY=
+  if [ "$3" = 1 ]; then
+    WHY="the worker is busy again"
+    return 0
+  fi
+  cur=$(busy_mark "$1")
+  case "$cur" in
+  *' busy')
+    WHY="the worker is running a turn"
+    return 0
+    ;;
+  esac
+  if [ "$cur" != "$EP_BUSY" ]; then
+    WHY="the worker took a turn since it stopped at the Claude usage limit"
+    return 0
+  fi
+  case "$cur" in *' idle') return 1 ;; esac
+  if [ -n "$EP_PANE" ] && [ "$2" = "$EP_PANE" ]; then
+    return 1
+  fi
+  if [ -n "$EP_PANE" ] && [ -n "$2" ]; then
+    WHY="the worker's pane changed since it stopped at the Claude usage limit"
+  else
+    WHY="neither an idle busy record nor an unchanged pane shows the worker still stopped at the Claude usage limit"
+  fi
+  return 0
+}
+
+evidence_desc() {  # <evidence> <detail>
+  case "$1" in
+  stop-failure:*) printf "Claude reported a rate_limit API error ('%s')" "$(one_line "$2")" ;;
+  *) printf "the pane shows '%s'" "$(one_line "$2")" ;;
+  esac
 }
 
 task_gen() {  # <task> <meta>
@@ -517,8 +570,8 @@ relaunch_task() {  # <task> <note> -> CONTROL_OUT
 }
 
 observe() {
-  local task=$1 pane_hash=$2 pane_line=$3 meta gen evidence detail own own_root own_email model
-  local rec rec_gen rec_error rec_msg until was_waiting=0 confirmed note from why
+  local task=$1 pane_hash=$2 pane_line=$3 window_busy=$4 meta gen evidence detail own own_root own_email model
+  local rec rec_gen rec_error rec_msg until was_waiting=0 confirmed note from
   fm_task_id_path_safe "$task" || die "invalid task id '$task'"
   meta="$STATE/$task.meta"
   [ -f "$meta" ] || { emit pass "no task record"; return 0; }
@@ -547,7 +600,9 @@ observe() {
     case "$EP_OUTCOME" in
     waiting)
       if [ "$NOW" -lt "$EP_UNTIL" ]; then
-        [ -z "$evidence" ] || episode_write "$task" "$gen" waiting "$evidence" "$EP_UNTIL" "$EP_DECLARED" "$(busy_mark "$task")"
+        case "$evidence" in
+        stop-failure:*) episode_write "$task" "$gen" waiting "$evidence" "$EP_UNTIL" "$EP_DECLARED" "$(busy_mark "$task")" "$pane_hash" ;;
+        esac
         emit absorb "waiting for a Claude usage reset until $(iso_of "$EP_UNTIL")"
         return 0
       fi
@@ -573,23 +628,20 @@ observe() {
   else
     EP_DECLARED=
   fi
-  if [ -z "$evidence" ] && [ "$was_waiting" = 1 ]; then
-    case "$EP_BUSY" in
-    *' idle')
-      [ "$(busy_mark "$task")" != "$EP_BUSY" ] || evidence=$EP_EVIDENCE
+  if [ "$was_waiting" = 1 ]; then
+    case "$evidence" in
+    stop-failure:*) ;;
+    *)
+      if worker_resumed "$task" "$pane_hash" "$window_busy"; then
+        episode_write "$task" "$gen" dismissed "${evidence:-$EP_EVIDENCE}" 0
+        [ -z "$EP_DECLARED" ] || status_append "$task" "resolved [key=$WAIT_KEY]: $WHY; nothing was relaunched"
+        log_event "$task: wait ended: $WHY; nothing relaunched"
+        emit pass "$WHY"
+        return 0
+      fi
+      evidence=${evidence:-$EP_EVIDENCE}
       ;;
     esac
-    if [ -z "$evidence" ]; then
-      case "$EP_BUSY" in
-      *' idle') why="the worker took a turn while it waited on the Claude usage limit" ;;
-      *) why="no busy record shows the worker still stopped at the Claude usage limit" ;;
-      esac
-      episode_write "$task" "$gen" dismissed "$EP_EVIDENCE" 0
-      [ -z "$EP_DECLARED" ] || status_append "$task" "resolved [key=$WAIT_KEY]: $why; nothing was relaunched"
-      log_event "$task: wait ended: $why; nothing relaunched"
-      emit pass "$why"
-      return 0
-    fi
   fi
   if [ -z "$evidence" ]; then
     emit pass "no usage-limit evidence for the current agent"
@@ -621,7 +673,6 @@ observe() {
     return 0
   fi
   confirmed=$was_waiting
-  case "$evidence" in stop-failure:*) confirmed=1 ;; esac
   if [ -n "$own_email" ]; then
     probe_account "$own_root" "$model"
     case "$PROBE_VERDICT" in
@@ -642,7 +693,7 @@ observe() {
       if [ "$was_waiting" = 0 ]; then
         episode_write "$task" "$gen" unconfirmed "$evidence" 0
         log_event "$task: unconfirmed $evidence: $PROBE_DETAIL"
-        emit wake "check: claude usage limit unconfirmed for $task: the pane shows '$(one_line "$detail")' but the account probe of $own_email failed ($PROBE_DETAIL); nothing was relaunched"
+        emit wake "check: claude usage limit unconfirmed for $task: $(evidence_desc "$evidence" "$detail") but the account probe of $own_email failed ($PROBE_DETAIL); nothing was relaunched"
         return 0
       fi
       ;;
@@ -651,7 +702,7 @@ observe() {
   if [ "$confirmed" = 0 ]; then
     episode_write "$task" "$gen" unconfirmed "$evidence" 0
     log_event "$task: unconfirmed $evidence: no readable account to probe"
-    emit wake "check: claude usage limit unconfirmed for $task: the pane shows '$(one_line "$detail")' but its account is not recorded or readable, so no probe could confirm the limit; nothing was relaunched"
+    emit wake "check: claude usage limit unconfirmed for $task: $(evidence_desc "$evidence" "$detail") but its account is not recorded or readable, so no live probe could confirm the limit; nothing was relaunched"
     return 0
   fi
 
@@ -677,7 +728,7 @@ observe() {
   if [ "$EP_DECLARED" != "$until" ]; then
     status_append "$task" "paused [key=$WAIT_KEY]: every Claude pool account is at its usage limit; waiting on $from until $(iso_of "$until")"
   fi
-  episode_write "$task" "$gen" waiting "$evidence" "$until" "$until" "$(busy_mark "$task")"
+  episode_write "$task" "$gen" waiting "$evidence" "$until" "$until" "$(busy_mark "$task")" "$pane_hash"
   log_event "$task: waiting until $(iso_of "$until")${NOTES:+ ($NOTES)}"
   if [ "$was_waiting" = 1 ]; then
     emit absorb "still waiting for a Claude usage reset until $(iso_of "$until")"
@@ -882,18 +933,19 @@ probe)
   probe_entry "$entry" "$model"
   ;;
 observe)
-  [ $# -ge 1 ] || die "usage: fm-claude-account-rotate.sh observe <task-id> [--pane-hash <hash>] [--pane-line <text>]"
-  task=$1 pane_hash='' pane_line=''
+  [ $# -ge 1 ] || die "usage: fm-claude-account-rotate.sh observe <task-id> [--pane-hash <hash>] [--pane-line <text>] [--window-busy]"
+  task=$1 pane_hash='' pane_line='' window_busy=0
   shift
   while [ $# -gt 0 ]; do
     case "$1" in
-    --pane-hash) pane_hash=${2:-} ;;
-    --pane-line) pane_line=${2:-} ;;
+    --pane-hash) pane_hash=${2:-}; shift ;;
+    --pane-line) pane_line=${2:-}; shift ;;
+    --window-busy) window_busy=1 ;;
     *) die "unknown observe option '$1'" ;;
     esac
-    shift 2 || break
+    shift || break
   done
-  observe "$task" "$pane_hash" "$pane_line"
+  observe "$task" "$pane_hash" "$pane_line" "$window_busy"
   ;;
 validation-scan) validation_scan ;;
 *) die "unknown subcommand '$cmd' (see --help)" ;;

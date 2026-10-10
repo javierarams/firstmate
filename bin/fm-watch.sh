@@ -1162,7 +1162,10 @@ secondmate_liveness_tick() {
 # scout window the evidence is the agent's StopFailure record
 # (state/<id>.api-error, written by the hook bin/fm-spawn.sh wires) or a pane
 # that kept the same hash across two polls and shows a usage-limit line
-# (fm_worker_account_claude_limit_line). `fm-claude-account-rotate.sh observe`
+# (fm_worker_account_claude_limit_line). Every observation also carries the
+# current pane hash and the window's busy classification, which observe uses
+# to leave alone a worker that resumed during a usage-limit wait.
+# `fm-claude-account-rotate.sh observe`
 # owns everything after that: confirming the limit with a live probe, relaunching
 # on the next usable pool account, declaring a timed wait when none is usable,
 # and deciding which outcome wakes, at most once per episode. This automatic
@@ -1177,6 +1180,7 @@ secondmate_liveness_tick() {
 # 1 otherwise; a wake exits the cycle.
 claude_limit_check() {  # <window> <task> <tail40> <hash> <prev-hash>
   local w=$1 task=$2 tail=$3 h=$4 prev=$5 meta key absorb pass line='' out verdict note
+  local -a args
   [ "$CLAUDE_ROTATION_ON" = 1 ] && [ -n "$task" ] || return 1
   meta="$STATE/$task.meta"
   case "$(fm_meta_get "$meta" kind)" in ship|scout) ;; *) return 1 ;; esac
@@ -1191,13 +1195,11 @@ claude_limit_check() {  # <window> <task> <tail40> <hash> <prev-hash>
     }
   fi
   [ -e "$absorb" ] || [ -n "$line" ] || [ -e "$STATE/$task.api-error" ] || return 1
-  if [ -n "$line" ]; then
-    out=$(FM_HOME="$FM_HOME" FM_STATE_OVERRIDE="$STATE" FM_CONFIG_OVERRIDE="$CONFIG" \
-      "$CLAUDE_ROTATE_BIN" observe "$task" --pane-hash "$h" --pane-line "$line" 2>>"$TRIAGE_LOG") || out=
-  else
-    out=$(FM_HOME="$FM_HOME" FM_STATE_OVERRIDE="$STATE" FM_CONFIG_OVERRIDE="$CONFIG" \
-      "$CLAUDE_ROTATE_BIN" observe "$task" 2>>"$TRIAGE_LOG") || out=
-  fi
+  args=(observe "$task" --pane-hash "$h")
+  [ -z "$line" ] || args+=(--pane-line "$line")
+  ! window_is_busy "$w" "$tail" || args+=(--window-busy)
+  out=$(FM_HOME="$FM_HOME" FM_STATE_OVERRIDE="$STATE" FM_CONFIG_OVERRIDE="$CONFIG" \
+    "$CLAUDE_ROTATE_BIN" "${args[@]}" 2>>"$TRIAGE_LOG") || out=
   verdict=${out%%$'\t'*}
   note=${out#*$'\t'}
   case "$verdict" in
