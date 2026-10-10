@@ -59,6 +59,11 @@
 #                   ordinary triage continues, except when this episode was
 #                   already waiting on a reset, which is then over. A failed
 #                   probe surfaces once as unconfirmed and acts on nothing.
+#                   A recorded account whose email the allowlist does not list
+#                   surfaces once naming it and acts on nothing. Without a
+#                   recorded, readable account only a StopFailure record
+#                   confirms the limit; pane evidence alone surfaces once as
+#                   unconfirmed and acts on nothing.
 #                3. Records every rejected account email with its reset in
 #                   state/claude-account-rotation/limited. Directories signed
 #                   in to one email are one account: one limited email skips
@@ -76,8 +81,10 @@
 #                   `paused [key=claude-usage-limit]: ... until <UTC>` line,
 #                   renewed only when the time changes - until the earliest
 #                   known reset (FM_CLAUDE_ROTATE_UNKNOWN_RESET_SECS after the
-#                   observation when an account reported none), then retries;
-#                   a later rotation appends the matching `resolved` line.
+#                   observation when an account reported none), then retries
+#                   only while the worker still shows fresh limit evidence;
+#                   without it the wait ends with nothing relaunched. Either
+#                   end appends the matching `resolved` line.
 #                A failed relaunch or an unconfirmed limit surfaces once and
 #                then passes the window back to ordinary stale triage for the
 #                rest of that incarnation; a block is retried every
@@ -495,7 +502,7 @@ relaunch_task() {  # <task> <note> -> CONTROL_OUT
 
 observe() {
   local task=$1 pane_hash=$2 pane_line=$3 meta gen evidence detail own own_root own_email model
-  local rec rec_gen rec_error rec_msg until was_waiting=0 note from
+  local rec rec_gen rec_error rec_msg until was_waiting=0 confirmed note from
   fm_task_id_path_safe "$task" || die "invalid task id '$task'"
   meta="$STATE/$task.meta"
   [ -f "$meta" ] || { emit pass "no task record"; return 0; }
@@ -549,11 +556,17 @@ observe() {
   else
     EP_DECLARED=
   fi
-  if [ "$was_waiting" = 0 ] && [ -z "$evidence" ]; then
+  if [ -z "$evidence" ]; then
+    if [ "$was_waiting" = 1 ]; then
+      episode_write "$task" "$gen" dismissed "$EP_EVIDENCE" 0
+      [ -z "$EP_DECLARED" ] || status_append "$task" "resolved [key=$WAIT_KEY]: the worker no longer shows the Claude usage limit; nothing was relaunched"
+      log_event "$task: wait ended without fresh limit evidence; nothing relaunched"
+      emit pass "the worker no longer shows the usage limit"
+      return 0
+    fi
     emit pass "no usage-limit evidence for the current agent"
     return 0
   fi
-  [ -n "$evidence" ] || evidence=$EP_EVIDENCE
 
   if ! validate_pool; then
     episode_write "$task" "$gen" blocked "$evidence" "$((NOW + RETRY_SECS))" "$EP_DECLARED"
@@ -573,10 +586,21 @@ observe() {
     own_root=$(fm_worker_account_claude_root "$own")
     own_email=$(fm_worker_account_claude_email "$own_root") || own_email=
   fi
-  if [ -n "$own_email" ] && printf '%s\n' "$ALLOWED" | grep -Fxq -- "$own_email"; then
+  if [ -n "$own_email" ] && ! printf '%s\n' "$ALLOWED" | grep -Fxq -- "$own_email"; then
+    episode_write "$task" "$gen" unconfirmed "$evidence" 0 "$EP_DECLARED"
+    log_event "$task: runs on $own_email, which is not on the allowlist; nothing relaunched"
+    emit wake "check: claude account not allowed: $task runs on $own_email ($own), which is not in config/claude-account-allowlist; stop its work; nothing was relaunched"
+    return 0
+  fi
+  confirmed=$was_waiting
+  case "$evidence" in stop-failure:*) confirmed=1 ;; esac
+  if [ -n "$own_email" ]; then
     probe_account "$own_root" "$model"
     case "$PROBE_VERDICT" in
-    rejected) mark_limited "$own_email" "$PROBE_RESET" ;;
+    rejected)
+      mark_limited "$own_email" "$PROBE_RESET"
+      confirmed=1
+      ;;
     allowed)
       clear_limited "$own_email"
       if [ "$was_waiting" = 0 ]; then
@@ -595,6 +619,12 @@ observe() {
       fi
       ;;
     esac
+  fi
+  if [ "$confirmed" = 0 ]; then
+    episode_write "$task" "$gen" unconfirmed "$evidence" 0
+    log_event "$task: unconfirmed $evidence: no readable account to probe"
+    emit wake "check: claude usage limit unconfirmed for $task: the pane shows '$(one_line "$detail")' but its account is not recorded or readable, so no probe could confirm the limit; nothing was relaunched"
+    return 0
   fi
 
   from=${own_email:-an unrecorded account}

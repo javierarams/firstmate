@@ -282,7 +282,7 @@ test_expired_wait_resumes_and_resolves_the_pause() {
   printf 'allowed\n' > "$CASE/b/probe"
   printf 'a@example.com\t1000\t900\nb@example.com\t1000\t900\n' > "$STATE/claude-account-rotation/limited"
   sed -i.bak 's/^until=.*/until=1000/' "$STATE/claude-account-rotation/episode-$ID" && rm -f "$STATE/claude-account-rotation/episode-$ID.bak"
-  out=$(rotate observe "$ID")
+  out=$(observe_pane)
   assert_equals wake "${out%%$'\t'*}" "an expired wait with a usable account must resume the worker: $out"
   assert_contains "$out" "check: claude account rotated: $ID relaunched on $CASE/a (a@example.com)" \
     "the worker should resume on the first usable account from the selection"
@@ -291,6 +291,59 @@ test_expired_wait_resumes_and_resolves_the_pause() {
     "resuming should resolve the declared pause"
   assert_absent "$STATE/claude-account-rotation/episode-$ID" "a resumed episode should be closed"
   pass "an expired wait retries, resumes the worker when an account frees, and resolves its pause"
+}
+
+test_expired_wait_leaves_a_resumed_worker_alone() {
+  local out
+  new_case resumed
+  printf 'rejected 1900000600\n' > "$CASE/a/probe"
+  printf 'rejected 1900000000\n' > "$CASE/b/probe"
+  out=$(observe_pane)
+  assert_equals wake "${out%%$'\t'*}" "the first sight should surface the wait: $out"
+  printf 'allowed\n' > "$CASE/a/probe"
+  printf 'allowed\n' > "$CASE/b/probe"
+  sed -i.bak 's/^until=.*/until=1000/' "$STATE/claude-account-rotation/episode-$ID" && rm -f "$STATE/claude-account-rotation/episode-$ID.bak"
+  out=$(rotate observe "$ID")
+  assert_equals pass "${out%%$'\t'*}" "an expired wait without fresh limit evidence must not act: $out"
+  assert_not_relaunched "a worker that resumed during its wait"
+  assert_equals 2 "$(probe_count)" "a resumed worker must not be probed again"
+  assert_contains "$(tail -n 1 "$STATE/$ID.status")" "resolved [key=claude-usage-limit] [at=" \
+    "ending the wait should resolve the declared pause"
+  out=$(rotate observe "$ID")
+  assert_equals pass "${out%%$'\t'*}" "the ended wait must stay quiet: $out"
+  pass "an expired wait whose worker no longer shows the limit ends without relaunching it"
+}
+
+test_unprobeable_own_account_needs_the_service_verdict() {
+  local out
+  new_case unrecorded
+  sed -i.bak '/^account=/d' "$STATE/$ID.meta" && rm -f "$STATE/$ID.meta.bak"
+  out=$(observe_pane)
+  assert_equals wake "${out%%$'\t'*}" "a pane line with no account to probe should surface: $out"
+  assert_contains "$out" "check: claude usage limit unconfirmed for $ID" "the wake should say the limit is unconfirmed"
+  assert_equals "" "$(meta_field account)" "the task record must not gain an account"
+  assert_no_grep "Firstmate operational input waiting" "$CASE/fake/literal" "no replacement may launch on a pane line alone"
+  assert_equals 0 "$(probe_count)" "nothing could be probed for an unrecorded account"
+  out=$(observe_pane h2)
+  assert_equals pass "${out%%$'\t'*}" "the unconfirmed episode must not alarm again: $out"
+
+  new_case unrecorded-stop-failure
+  sed -i.bak '/^account=/d' "$STATE/$ID.meta" && rm -f "$STATE/$ID.meta.bak"
+  printf '{"error":"rate_limit","last_assistant_message":"API Error"}\n' | "$ROTATE" record-stop-failure "$STATE" "$ID" --gen gen-1
+  out=$(rotate observe "$ID")
+  assert_equals wake "${out%%$'\t'*}" "Claude's own rate_limit record confirms the limit: $out"
+  assert_equals "$CASE/a" "$(meta_field account)" "the confirmed limit should relaunch on the first usable account"
+
+  new_case disallowed-own
+  claude_root "$CASE/x" intruder@example.org
+  sed -i.bak "s|^account=.*|account=$CASE/x|" "$STATE/$ID.meta" && rm -f "$STATE/$ID.meta.bak"
+  out=$(observe_pane)
+  assert_equals wake "${out%%$'\t'*}" "a worker on a disallowed account must surface: $out"
+  assert_contains "$out" "check: claude account not allowed: $ID runs on intruder@example.org" "the wake should name the disallowed email"
+  assert_equals "$CASE/x" "$(meta_field account)" "the task record must keep its account"
+  assert_no_grep "Firstmate operational input waiting" "$CASE/fake/literal" "a disallowed account's worker must not be relaunched"
+  assert_equals 0 "$(probe_count)" "a disallowed account must never be probed"
+  pass "without a probeable allowed own account, a pane line alone never relaunches and a disallowed account is named"
 }
 
 test_same_email_directories_are_one_account() {
@@ -509,6 +562,8 @@ test_confirmed_limit_relaunches_on_the_next_account
 test_unlimited_account_dismisses_the_evidence
 test_every_account_limited_declares_one_timed_wait
 test_expired_wait_resumes_and_resolves_the_pause
+test_expired_wait_leaves_a_resumed_worker_alone
+test_unprobeable_own_account_needs_the_service_verdict
 test_same_email_directories_are_one_account
 test_signed_out_and_unprobeable_accounts_are_skipped
 test_unlisted_account_stops_the_rotation
