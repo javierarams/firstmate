@@ -86,9 +86,14 @@
 #                   known reset (FM_CLAUDE_ROTATE_UNKNOWN_RESET_SECS after the
 #                   observation when an account reported none), then retries.
 #                   The wait snapshots the worker's busy record (seq and state,
-#                   bin/fm-busy-lib.sh) and pane hash, and only a new
-#                   StopFailure record during the wait - the worker stopped at
-#                   the limit again - refreshes that snapshot. At expiry a
+#                   bin/fm-busy-lib.sh) and pane hash. During the wait only a
+#                   new stop at the limit refreshes that snapshot: a new
+#                   StopFailure record (a busy mark read before its idle event
+#                   lands is stored as that idle event), or a limit line on a
+#                   pane hash other than the snapshot's that a live probe of
+#                   the worker's own account answers rejected right then. Each
+#                   such hash is probed once; an allowed answer refreshes
+#                   nothing. At expiry a
 #                   worker the watcher classifies busy, whose busy record says
 #                   busy or moved since the snapshot, or, with no idle busy
 #                   record, whose pane changed, has resumed: the wait ends with
@@ -461,10 +466,10 @@ block_clear() {
 
 # --- episodes -----------------------------------------------------------------
 
-EP_GEN='' EP_OUTCOME='' EP_EVIDENCE='' EP_UNTIL='' EP_DECLARED='' EP_BUSY='' EP_PANE=''
+EP_GEN='' EP_OUTCOME='' EP_EVIDENCE='' EP_UNTIL='' EP_DECLARED='' EP_BUSY='' EP_PANE='' EP_PROBED=''
 episode_read() {  # <task>
   local line
-  EP_GEN='' EP_OUTCOME='' EP_EVIDENCE='' EP_UNTIL='' EP_DECLARED='' EP_BUSY='' EP_PANE=''
+  EP_GEN='' EP_OUTCOME='' EP_EVIDENCE='' EP_UNTIL='' EP_DECLARED='' EP_BUSY='' EP_PANE='' EP_PROBED=''
   [ -f "$R/episode-$1" ] || return 1
   while IFS= read -r line || [ -n "$line" ]; do
     case "$line" in
@@ -475,13 +480,14 @@ episode_read() {  # <task>
     declared=*) EP_DECLARED=${line#declared=} ;;
     busy=*) EP_BUSY=${line#busy=} ;;
     pane=*) EP_PANE=${line#pane=} ;;
+    probed=*) EP_PROBED=${line#probed=} ;;
     esac
   done < "$R/episode-$1"
   case "$EP_UNTIL" in '' | *[!0-9]*) EP_UNTIL=0 ;; esac
   return 0
 }
 
-episode_write() {  # <task> <gen> <outcome> <evidence> <until> [declared] [busy] [pane]
+episode_write() {  # <task> <gen> <outcome> <evidence> <until> [declared] [busy] [pane] [probed]
   write_file "$R/episode-$1" "gen=$2
 outcome=$3
 evidence=$4
@@ -489,6 +495,7 @@ until=$5
 declared=${6:-}
 busy=${7:-}
 pane=${8:-}
+probed=${9:-}
 "
 }
 
@@ -560,6 +567,22 @@ emit() {  # <verdict> <text>
   printf '%s\t%s\n' "$1" "$(printf '%s' "$2" | tr '\t\n\r' '   ')"
 }
 
+# own_limited <meta> -> 0 when the task's recorded, allowlisted account answers
+# a live probe rejected (recorded as limited); OWN_EMAIL names it.
+OWN_EMAIL=
+own_limited() {
+  local own root
+  OWN_EMAIL=
+  own=$(fm_meta_get "$1" account)
+  [ -n "$own" ] || return 1
+  root=$(fm_worker_account_claude_root "$own")
+  OWN_EMAIL=$(fm_worker_account_claude_email "$root") || return 1
+  fm_worker_account_allowlist "$CONFIG" 2>/dev/null | grep -Fxq -- "$OWN_EMAIL" || return 1
+  probe_account "$root" "$(fm_meta_get "$1" model)"
+  [ "$PROBE_VERDICT" = rejected ] || return 1
+  mark_limited "$OWN_EMAIL" "$PROBE_RESET"
+}
+
 relaunch_task() {  # <task> <note> -> CONTROL_OUT
   local note_file="$R/note-$1"
   printf '%s\n' "$2" > "$note_file" || return 1
@@ -571,7 +594,7 @@ relaunch_task() {  # <task> <note> -> CONTROL_OUT
 
 observe() {
   local task=$1 pane_hash=$2 pane_line=$3 window_busy=$4 meta gen evidence detail own own_root own_email model
-  local rec rec_gen rec_error rec_msg until was_waiting=0 confirmed note from
+  local rec rec_gen rec_error rec_msg until was_waiting=0 confirmed note from mark
   fm_task_id_path_safe "$task" || die "invalid task id '$task'"
   meta="$STATE/$task.meta"
   [ -f "$meta" ] || { emit pass "no task record"; return 0; }
@@ -601,7 +624,21 @@ observe() {
     waiting)
       if [ "$NOW" -lt "$EP_UNTIL" ]; then
         case "$evidence" in
-        stop-failure:*) episode_write "$task" "$gen" waiting "$evidence" "$EP_UNTIL" "$EP_DECLARED" "$(busy_mark "$task")" "$pane_hash" ;;
+        stop-failure:*)
+          mark=$(busy_mark "$task")
+          case "$mark" in [0-9]*' busy') mark="$((${mark%% *} + 1)) idle" ;; esac
+          episode_write "$task" "$gen" waiting "$evidence" "$EP_UNTIL" "$EP_DECLARED" "$mark" "$pane_hash" "$EP_PROBED"
+          ;;
+        pane:*)
+          if [ "$pane_hash" != "$EP_PANE" ] && [ "$pane_hash" != "$EP_PROBED" ]; then
+            if own_limited "$meta"; then
+              episode_write "$task" "$gen" waiting "$evidence" "$EP_UNTIL" "$EP_DECLARED" "$(busy_mark "$task")" "$pane_hash" "$pane_hash"
+              log_event "$task: new limit line during the wait confirmed by $OWN_EMAIL"
+            else
+              episode_write "$task" "$gen" waiting "$EP_EVIDENCE" "$EP_UNTIL" "$EP_DECLARED" "$EP_BUSY" "$EP_PANE" "$pane_hash"
+            fi
+          fi
+          ;;
         esac
         emit absorb "waiting for a Claude usage reset until $(iso_of "$EP_UNTIL")"
         return 0

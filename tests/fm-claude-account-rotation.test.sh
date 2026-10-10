@@ -368,10 +368,10 @@ expire_wait() {
   sed -i.bak 's/^until=.*/until=1000/' "$STATE/claude-account-rotation/episode-$ID" && rm -f "$STATE/claude-account-rotation/episode-$ID.bak"
 }
 
-assert_wait_ended_untouched() {  # <out> <msg>
+assert_wait_ended_untouched() {  # <out> <msg> [probes]
   assert_equals pass "${1%%$'\t'*}" "$2: the expired wait must pass the worker back: $1"
   assert_not_relaunched "$2"
-  assert_equals 2 "$(probe_count)" "$2: a resumed worker must not be probed again"
+  assert_equals "${3:-2}" "$(probe_count)" "$2: a resumed worker must not be probed again"
   assert_contains "$(tail -n 1 "$STATE/$ID.status")" "resolved [key=claude-usage-limit] [at=" "$2: ending the wait should resolve the declared pause"
 }
 
@@ -398,8 +398,63 @@ test_expired_wait_ignores_an_old_limit_line_on_a_resumed_worker() {
   assert_equals absorb "${out%%$'\t'*}" "a limit line seen again during the wait keeps the wait: $out"
   expire_wait
   out=$(observe_pane h9)
-  assert_wait_ended_untouched "$out" "a limit line seen during the wait is no new stop"
+  assert_wait_ended_untouched "$out" "a limit line its account answers allowed to is no new stop" 3
   pass "an expired wait leaves alone a worker that took a turn, even while an old limit line is on its pane"
+}
+
+test_stop_failure_read_mid_hook_keeps_the_stop() {
+  local out
+  new_case mid-hook
+  wait_on_stop_failure
+  sed -i.bak 's/^until=.*/until=1900000000/' "$STATE/claude-account-rotation/episode-$ID" && rm -f "$STATE/claude-account-rotation/episode-$ID.bak"
+  busy_record 5 busy
+  printf '{"error":"rate_limit","last_assistant_message":"API Error"}\n' | "$ROTATE" record-stop-failure "$STATE" "$ID" --gen gen-1
+  out=$(rotate observe "$ID")
+  assert_equals absorb "${out%%$'\t'*}" "a limit hit read before its idle event keeps the wait: $out"
+  busy_record 6 idle
+  expire_wait
+  out=$(rotate observe "$ID")
+  assert_contains "$out" "check: claude account rotated: $ID relaunched on $CASE/a (a@example.com)" \
+    "the stop whose idle event landed after the read must be retried at expiry"
+  pass "a StopFailure record read before its idle event snapshots the idle stop it is about to record"
+}
+
+# wait_on_pane_then_new_line <h2-probe>: an all-limited pool waits on pane h1
+# with no StopFailure or busy record; the worker resumes and a new limit line h2
+# appears while its own account answers <h2-probe>.
+wait_on_pane_then_new_line() {
+  local out
+  printf 'rejected 1900000600\n' > "$CASE/a/probe"
+  printf 'rejected 1900000000\n' > "$CASE/b/probe"
+  out=$(observe_pane h1)
+  assert_equals wake "${out%%$'\t'*}" "the first sight should surface the wait: $out"
+  printf '%s\n' "$1" > "$CASE/a/probe"
+  out=$(observe_pane h2)
+  assert_equals absorb "${out%%$'\t'*}" "a new limit line during the wait keeps the wait: $out"
+  assert_equals 3 "$(probe_count)" "a new limit line must be confirmed by one probe of the worker's own account"
+  out=$(observe_pane h2)
+  assert_equals absorb "${out%%$'\t'*}" "the same new line keeps the wait: $out"
+  assert_equals 3 "$(probe_count)" "one pane hash must be probed at most once"
+  printf 'allowed\n' > "$CASE/a/probe"
+  printf 'allowed\n' > "$CASE/b/probe"
+  printf 'a@example.com\t1000\t900\nb@example.com\t1000\t900\n' > "$STATE/claude-account-rotation/limited"
+  expire_wait
+}
+
+test_expired_wait_reads_a_new_limit_line_through_the_probe() {
+  local out
+  new_case new-line-rejected
+  wait_on_pane_then_new_line "rejected 1900000600"
+  out=$(observe_pane h2)
+  assert_contains "$out" "check: claude account rotated: $ID relaunched on $CASE/a (a@example.com)" \
+    "a new limit line its account confirmed must be retried at expiry"
+
+  new_case new-line-allowed
+  wait_on_pane_then_new_line allowed
+  out=$(observe_pane h2)
+  assert_wait_ended_untouched "$out" "a new limit line its account answered allowed to" 3
+  assert_contains "$out" "the worker's pane changed since it stopped at the Claude usage limit" "the pass should say why"
+  pass "a new limit line during a wait refreshes it only when the worker's own account is still limited"
 }
 
 test_expired_wait_leaves_a_busy_window_alone() {
@@ -700,6 +755,8 @@ test_expired_wait_retries_a_worker_still_stopped
 test_expired_wait_retries_a_worker_limited_again_during_the_wait
 test_expired_wait_leaves_a_resumed_worker_alone
 test_expired_wait_ignores_an_old_limit_line_on_a_resumed_worker
+test_stop_failure_read_mid_hook_keeps_the_stop
+test_expired_wait_reads_a_new_limit_line_through_the_probe
 test_expired_wait_leaves_a_busy_window_alone
 test_expired_wait_without_busy_record_reads_the_pane
 test_unprobeable_own_account_needs_the_service_verdict

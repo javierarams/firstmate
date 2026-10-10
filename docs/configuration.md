@@ -915,6 +915,7 @@ When a Claude ship or scout stops at its usage limit, the watcher notices either
   It records that account as the selection, so new spawns use it too, and relaunches the worker on it with its local copy, instructions, model, and effort preserved and its account recorded in the task record.
 - When no account is usable it keeps the worker where it is, declares a wait in the worker's status log until the earliest known reset, and retries then only if the worker is still stopped.
   A worker that supervision sees busy, whose busy record shows a turn since its latest stop at the limit, or, without an idle busy record, whose pane changed, has resumed on its own: it is left alone and the wait is resolved, even when an old limit line is still on its pane.
+  A latest stop is a new API-error record during the wait, or a new usage-limit line (on a pane that changed since the last stop) that a live turn on the worker's own account confirms is still limited when it appears; a new line whose account answers is no stop.
 
 Each episode surfaces as one supervision notification: the rotation, the wait, a blocker, or a relaunch that could not complete.
 A secondmate agent is never rotated; it takes the current selection at its next launch.
