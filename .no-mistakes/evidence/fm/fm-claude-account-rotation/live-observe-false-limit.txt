@@ -1,0 +1,9 @@
+# Healthy worker on qualabs; pane shows a usage-limit line (e.g. from a grep). Live probe must dismiss it.
+$ fm-claude-account-rotate.sh observe livetask --pane-hash h1 --pane-line "You've hit your session limit · resets 3pm"
+pass	the recorded account javier@qualabs.com is not limited
+exit 0
+--- meta account after:
+account=/Users/javieraramberri/.claude-configs/qualabs
+--- rotation log:
+2026-10-10T04:25Z	selected /Users/javieraramberri/.claude-configs/qualabs by hand
+2026-10-10T04:25Z	livetask: dismissed pane:h1; javier@qualabs.com answers allowed

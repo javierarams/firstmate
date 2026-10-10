@@ -1,0 +1,7 @@
+ok - a rotation wake verdict is queued and surfaced as one check wake
+ok - an absorb verdict keeps a limited worker out of ordinary stale triage and is re-observed each poll
+ok - a pass verdict leaves stale triage unchanged and is not re-observed for the same pane
+ok - only a stable limit pane of a Claude ship or scout in a home with a pool reaches the rotation
+ok - a StopFailure record reaches the rotation even when the pane shows no limit line
+ok - the validation scan runs only with a pool and each report wakes once
+# all fm-watch-claude-rotation tests passed

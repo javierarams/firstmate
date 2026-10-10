@@ -1,0 +1,19 @@
+ok - observe leaves a home without a rotation pool exactly as it was
+ok - a confirmed usage limit relaunches the worker on the next usable account and records it
+ok - a limit line the service does not confirm is dismissed once and never relaunches
+ok - an all-limited pool keeps the worker in place and declares one wait until the earliest reset
+ok - an expired wait retries, resumes the worker when an account frees, and resolves its pause
+ok - an expired wait retries a worker whose busy record shows no turn since, with no pane line
+ok - a worker that hits the limit again during its wait is retried against its latest stop
+ok - an expired wait whose worker took a turn since ends without relaunching it
+ok - without a probeable allowed own account, a pane line alone never relaunches and a disallowed account is named
+ok - directories signed in to one email share its limit and are skipped together
+ok - signed-out accounts and failed probes are skipped for the next usable account
+ok - an account outside the allowlist, or a missing allowlist, stops the rotation once until the pool is fixed
+ok - a limit the live probe cannot confirm surfaces once and relaunches nothing
+ok - a StopFailure rate_limit record of the current agent is evidence on its own, and a stale or unrelated one is not
+ok - a task on the default model is probed with the model each account's settings choose
+ok - status reports the pool and select records only a pool entry
+ok - a no-mistakes run that died at its daemon agent's usage limit is reported once with the daemon's account and the next usable one
+ok - the usage-limit matcher reads several phrasings near the bottom and ignores warnings and history
+# all fm-claude-account-rotation tests passed

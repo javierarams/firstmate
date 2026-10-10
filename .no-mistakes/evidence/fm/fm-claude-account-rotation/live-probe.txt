@@ -1,0 +1,6 @@
+$ fm-claude-account-rotate.sh probe ~/.claude-configs/personal --model claude-haiku-4-5
+allowed 1792026000
+exit 0
+$ fm-claude-account-rotate.sh probe ~/.claude-configs/qualabs --model claude-haiku-4-5
+allowed 1791621600
+exit 0

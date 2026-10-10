@@ -1,0 +1,22 @@
+# Pool now includes a directory signed in to someone@other.com (not on the allowlist)
+$ status
+pool: 3 entries; selected /Users/javieraramberri/.claude-configs/qualabs
+  /Users/javieraramberri/.claude-configs/personal  javieraramberri37@gmail.com allowed
+* /Users/javieraramberri/.claude-configs/qualabs  javier@qualabs.com allowed
+  /var/folders/n1/7vkblp1d4lj_hc9_t82w28680000gn/T//fm-lab.U0WeW0/rogue  someone@other.com NOT ALLOWED
+exit 0
+$ select <rogue>
+error: config/claude-account selects /var/folders/n1/7vkblp1d4lj_hc9_t82w28680000gn/T//fm-lab.U0WeW0/rogue, which is signed in as someone@other.com, an account config/claude-account-allowlist does not list; Firstmate never launches it - sign that root in to an allowed account, or remove it from config/claude-account
+exit 1
+$ observe livetask --pane-hash h2 --pane-line "...usage limit..."
+wake	check: claude account rotation stopped: pool entry /var/folders/n1/7vkblp1d4lj_hc9_t82w28680000gn/T//fm-lab.U0WeW0/rogue is signed in as someone@other.com, which config/claude-account-allowlist does not list; livetask stays stopped on its current account and nothing launches on the pool until config/claude-account and config/claude-account-allowlist agree
+exit 0
+$ observe again (must not re-wake)
+absorb	account rotation is blocked: pool entry /var/folders/n1/7vkblp1d4lj_hc9_t82w28680000gn/T//fm-lab.U0WeW0/rogue is signed in as someone@other.com, which config/claude-account-allowlist does not list
+exit 0
+--- meta account after:
+account=/Users/javieraramberri/.claude-configs/qualabs
+--- log tail:
+2026-10-10T04:25Z	selected /Users/javieraramberri/.claude-configs/qualabs by hand
+2026-10-10T04:25Z	livetask: dismissed pane:h1; javier@qualabs.com answers allowed
+2026-10-10T04:25Z	blocked: pool entry /var/folders/n1/7vkblp1d4lj_hc9_t82w28680000gn/T//fm-lab.U0WeW0/rogue is signed in as someone@other.com, which config/claude-account-allowlist does not list

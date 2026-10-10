@@ -1,0 +1,15 @@
+$ fm-claude-account-rotate.sh status
+pool: 2 entries; selected /Users/javieraramberri/.claude-configs/personal
+* /Users/javieraramberri/.claude-configs/personal  javieraramberri37@gmail.com allowed
+  /Users/javieraramberri/.claude-configs/qualabs  javier@qualabs.com allowed
+exit 0
+$ fm-claude-account-rotate.sh select ~/.claude-configs/qualabs
+selected /Users/javieraramberri/.claude-configs/qualabs
+exit 0
+$ fm-claude-account-rotate.sh select /tmp/not-a-pool-entry
+error: '/tmp/not-a-pool-entry' is not an entry of config/claude-account
+exit 1
+$ status
+pool: 2 entries; selected /Users/javieraramberri/.claude-configs/qualabs
+  /Users/javieraramberri/.claude-configs/personal  javieraramberri37@gmail.com allowed
+* /Users/javieraramberri/.claude-configs/qualabs  javier@qualabs.com allowed

@@ -1,0 +1,3 @@
+ok - claude 2.1.296 (Claude Code): the rotation probe reads 'allowed 1791621600' for /Users/javieraramberri/.claude-configs/qualabs from the stream's rate_limit_event
+ok - claude 2.1.296 (Claude Code): a StopFailure turn records error type 'model_not_found' for the current incarnation
+# claude account rotation live guard checked: claude 2.1.296 (Claude Code)
