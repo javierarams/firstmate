@@ -22,6 +22,17 @@
 # one absolute path to an existing readable, searchable directory. Firstmate
 # never copies credentials or changes a global login.
 #
+# config/claude-account may instead list several such entries, one per line
+# and none twice: an ordered rotation pool. A launch then selects the entry
+# bin/fm-claude-account-rotate.sh last recorded in
+# state/claude-account-rotation/selected, or the first entry when that record
+# is absent or names an entry the pool no longer holds. A pool requires
+# config/claude-account-allowlist, one account email per line. Whenever that
+# allowlist exists, every pinned Claude launch reads the selected root's
+# account email from its .claude.json (oauthAccount.emailAddress;
+# ~/.claude.json for ordinary) and refuses an email the allowlist does not
+# list, or one it cannot read, before the sign-in check runs.
+#
 # A Pi root can hold several provider identities, so config/pi-account names
 # the root on line 1 and the providers that home may spend on line 2,
 # separated by spaces. A pinned Pi launch must name its provider explicitly as
@@ -75,13 +86,14 @@ fm_worker_account_file() {
 }
 
 # fm_worker_account_read <harness> <file>
-# Prints "declared<TAB>providers" for a valid pin, where declared is
-# `ordinary` or the absolute path and providers is empty for Claude. The final
-# newline is optional; any other control byte, including a CR, is malformed.
-# Parses bytes before the shell can drop NULs or trailing newlines; paths are
-# literal, never shell expressions. Returns 0 on success, 3 when the file does
-# not exist, 4 when it cannot be inspected (one error already printed), 5 when
-# it is not a readable regular file, and 6 when it is malformed.
+# For Pi prints "declared<TAB>providers", where declared is `ordinary` or the
+# absolute path. For Claude prints each declared entry on its own line, in
+# file order. The final newline is optional; any other control byte, including
+# a CR, is malformed. Parses bytes before the shell can drop NULs or trailing
+# newlines; paths are literal, never shell expressions. Returns 0 on success,
+# 3 when the file does not exist, 4 when it cannot be inspected (one error
+# already printed), 5 when it is not a readable regular file, 6 when it is
+# malformed, and 7 when a Claude pool lists one entry twice.
 fm_worker_account_read() {
   perl -MErrno=ENOENT -e '
     my ($harness, $f) = @ARGV;
@@ -94,8 +106,13 @@ fm_worker_account_read() {
     open(my $fh, "<", $f) or exit 5;
     my $body = do { local $/; <$fh> } // "";
     if ($harness eq "claude") {
-      $body =~ /\A(ordinary|\/[^\x00-\x1f\x7f]*)\n?\z/ or exit 6;
-      print $1, "\t";
+      my $entry = qr/(?:ordinary|\/[^\x00-\x1f\x7f]*)/;
+      $body =~ /\A($entry(?:\n$entry)*)\n?\z/ or exit 6;
+      my %seen;
+      for my $e (split /\n/, $1) {
+        exit 7 if $seen{$e}++;
+        print $e, "\n";
+      }
     } else {
       $body =~ /\A(ordinary|\/[^\x00-\x1f\x7f]*)\n([A-Za-z0-9][A-Za-z0-9._-]*(?: +[A-Za-z0-9][A-Za-z0-9._-]*)*)\n?\z/ or exit 6;
       print $1, "\t", $2;
@@ -103,36 +120,202 @@ fm_worker_account_read() {
   ' -- "$1" "$2"
 }
 
-# fm_worker_account_resolve <harness> <config-dir>
-# Prints "declared<TAB>root<TAB>providers" for a valid pin, where root is the
-# directory the launch selects (empty for ordinary Claude, meaning
-# CLAUDE_CONFIG_DIR unset). Prints nothing and returns 0 when the runner is
+# fm_worker_account_entries <harness> <config-dir>
+# Prints the parsed pin: for Claude every declared entry on its own line, for
+# Pi "declared<TAB>providers". Prints nothing and returns 0 when the runner is
 # not pinnable or the home has no pin. On refusal prints one error naming the
 # file and returns 1.
-fm_worker_account_resolve() {
-  local harness=$1 config=$2 file cfg token rc declared root fallback
+fm_worker_account_entries() {
+  local harness=$1 config=$2 file cfg rc
   file=$(fm_worker_account_file "$harness") || return 0
   cfg="$config/$file"
-  token=$(fm_worker_account_read "$harness" "$cfg")
+  fm_worker_account_read "$harness" "$cfg"
   rc=$?
   case "$rc" in
-  0) ;;
-  3) return 0 ;;
+  0 | 3) return 0 ;;
   4) return 1 ;;
   5)
     echo "error: config/$file must be a readable regular file: $cfg" >&2
+    return 1
+    ;;
+  7)
+    echo "error: config/$file lists the same account entry twice; each pool entry must appear once: $cfg" >&2
     return 1
     ;;
   *)
     if [ "$file" = pi-account ]; then
       echo "error: config/$file must hold 'ordinary' or one absolute path on line 1 and the providers this home may spend on line 2, separated by spaces, with no other lines or control characters: $cfg" >&2
     else
-      echo "error: config/$file must hold 'ordinary' or one absolute path on a single line with no control characters: $cfg" >&2
+      echo "error: config/$file must hold 'ordinary' or absolute paths, one per line, with no blank lines or control characters: $cfg" >&2
     fi
     return 1
     ;;
   esac
-  declared=${token%%$'\t'*}
+}
+
+# fm_worker_account_rotation_dir <state-dir>
+# The runtime record directory bin/fm-claude-account-rotate.sh owns.
+fm_worker_account_rotation_dir() {
+  printf '%s/claude-account-rotation\n' "$1"
+}
+
+# fm_worker_account_claude_selected <entries> <state-dir>
+# Prints the pool entry a launch selects: the recorded selection when it names
+# one of <entries> (newline-separated), otherwise the first entry.
+fm_worker_account_claude_selected() {
+  local entries=$1 state=${2:-} recorded=
+  if [ -n "$state" ]; then
+    recorded=$(head -n 1 "$(fm_worker_account_rotation_dir "$state")/selected" 2>/dev/null) || recorded=
+  fi
+  if [ -n "$recorded" ] && printf '%s\n' "$entries" | grep -Fxq -- "$recorded"; then
+    printf '%s\n' "$recorded"
+  else
+    printf '%s\n' "$entries" | head -n 1
+  fi
+}
+
+# fm_worker_account_claude_pool_size <config-dir>
+# Prints how many entries config/claude-account lists: 0 with no pin or a
+# malformed one, 1 for a single pin, two or more for a rotation pool.
+fm_worker_account_claude_pool_size() {
+  local entries
+  entries=$(fm_worker_account_entries claude "$1" 2>/dev/null) || entries=
+  if [ -z "$entries" ]; then
+    printf '0\n'
+  else
+    printf '%s\n' "$entries" | wc -l | tr -d '[:space:]'
+    printf '\n'
+  fi
+}
+
+# fm_worker_account_claude_limit_line <text>
+# Prints the usage-limit line Claude rendered among the last 15 non-blank
+# lines of <text> (a pane capture or an agent log tail), with surrounding
+# borders and bullets trimmed, and returns 0; returns 1 when there is none.
+# Any of several independent phrasings counts, so no single vendor string is
+# load-bearing: "You've hit your <kind> limit" (any apostrophe), "usage limit
+# reached" (including the older "Claude AI usage limit reached|<epoch>"), and
+# "<session|weekly|daily|5-hour|Opus|Sonnet> limit reached". A match is only
+# a trigger: bin/fm-claude-account-rotate.sh confirms it with a live probe
+# before anything is relaunched.
+fm_worker_account_claude_limit_line() {
+  local line
+  line=$(printf '%s\n' "$1" | LC_ALL=C grep -v '^[[:space:]]*$' | tail -n 15 |
+    LC_ALL=C grep -Ei "you( ha|[^[:alpha:][:space:]]{0,4})ve (hit|reached) your [[:alnum:] -]*limit|usage limit reached|(session|weekly|daily|5-hour|five-hour|opus|sonnet) limit reached" |
+    tail -n 1 | LC_ALL=C sed 's/^[^A-Za-z0-9]*//; s/[^A-Za-z0-9)]*$//') || return 1
+  [ -n "$line" ] || return 1
+  printf '%s\n' "$line" | cut -c1-200
+}
+
+# fm_worker_account_claude_root <declared>
+# Prints the CLAUDE_CONFIG_DIR a declared entry selects; empty for ordinary.
+fm_worker_account_claude_root() {
+  [ "$1" = ordinary ] || printf '%s\n' "$1"
+}
+
+# fm_worker_account_claude_email <root>
+# Prints the lowercased oauthAccount.emailAddress of the Claude store a root
+# selects ($HOME/.claude.json when root is empty). Returns 1, silently, when
+# the store or the field cannot be read.
+fm_worker_account_claude_email() {
+  local store email
+  if [ -n "$1" ]; then
+    store="$1/.claude.json"
+  else
+    store="${HOME:-}/.claude.json"
+  fi
+  email=$(jq -r '.oauthAccount.emailAddress // empty | strings' "$store" 2>/dev/null) || return 1
+  case "$email" in
+  '' | *[[:space:]]* | *[[:cntrl:]]*) return 1 ;;
+  esac
+  printf '%s\n' "$email" | tr '[:upper:]' '[:lower:]'
+}
+
+# fm_worker_account_allowlist <config-dir>
+# Prints config/claude-account-allowlist's emails, lowercased, one per line.
+# Returns 3 when the file does not exist; otherwise refuses a file that is not
+# a readable regular file, or that holds anything but one address per line,
+# with one error naming it, and returns 1.
+fm_worker_account_allowlist() {
+  local cfg="$1/claude-account-allowlist" rc
+  perl -MErrno=ENOENT -e '
+    my $f = $ARGV[0];
+    unless (lstat $f) {
+      exit 3 if $! == ENOENT;
+      print STDERR "error: cannot inspect configuration source at $f: $!\n";
+      exit 4;
+    }
+    (-f $f && -r _) or exit 5;
+    open(my $fh, "<", $f) or exit 5;
+    my $body = do { local $/; <$fh> } // "";
+    my $addr = qr/[^\s\@\x00-\x1f\x7f]+\@[^\s\@\x00-\x1f\x7f]+/;
+    $body =~ /\A($addr(?:\n$addr)*)\n?\z/ or exit 6;
+    print lc($_), "\n" for split /\n/, $1;
+  ' -- "$cfg"
+  rc=$?
+  case "$rc" in
+  0 | 3) return "$rc" ;;
+  4) return 1 ;;
+  5)
+    echo "error: config/claude-account-allowlist must be a readable regular file: $cfg" >&2
+    return 1
+    ;;
+  *)
+    echo "error: config/claude-account-allowlist must hold one account email per line, with no blank lines, spaces, or control characters: $cfg" >&2
+    return 1
+    ;;
+  esac
+}
+
+# fm_worker_account_claude_allowed <config-dir> <declared> <root> [<pool-size>]
+# Applies config/claude-account-allowlist to one selected entry. Returns 0
+# when no allowlist applies (the file is absent and the pin is a single
+# entry) or the entry's account email is listed; otherwise prints one error
+# and returns 1. A pool of two or more entries requires the allowlist.
+fm_worker_account_claude_allowed() {
+  local config=$1 declared=$2 root=$3 pool=${4:-1} allow rc email
+  allow=$(fm_worker_account_allowlist "$config")
+  rc=$?
+  case "$rc" in
+  0) ;;
+  3)
+    [ "$pool" -le 1 ] && return 0
+    echo "error: config/claude-account lists a rotation pool of $pool accounts, which requires config/claude-account-allowlist naming the account emails Firstmate may launch: $config/claude-account-allowlist" >&2
+    return 1
+    ;;
+  *) return 1 ;;
+  esac
+  if ! email=$(fm_worker_account_claude_email "$root"); then
+    echo "error: config/claude-account selects $declared, but its account email cannot be read from ${root:-${HOME:-~}}/.claude.json (oauthAccount.emailAddress), so it cannot be checked against config/claude-account-allowlist; sign that root in, or remove it from config/claude-account" >&2
+    return 1
+  fi
+  if ! printf '%s\n' "$allow" | grep -Fxq -- "$email"; then
+    echo "error: config/claude-account selects $declared, which is signed in as $email, an account config/claude-account-allowlist does not list; Firstmate never launches it - sign that root in to an allowed account, or remove it from config/claude-account" >&2
+    return 1
+  fi
+  return 0
+}
+
+# fm_worker_account_resolve <harness> <config-dir> [<state-dir>]
+# Prints "declared<TAB>root<TAB>providers" for a valid pin, where root is the
+# directory the launch selects (empty for ordinary Claude, meaning
+# CLAUDE_CONFIG_DIR unset). A Claude pool resolves to the selected entry
+# (fm_worker_account_claude_selected) and fills providers with the pool size.
+# Prints nothing and returns 0 when the runner is not pinnable or the home
+# has no pin. On refusal prints one error naming the file and returns 1.
+fm_worker_account_resolve() {
+  local harness=$1 config=$2 state=${3:-} file cfg entries token declared root fallback
+  file=$(fm_worker_account_file "$harness") || return 0
+  entries=$(fm_worker_account_entries "$harness" "$config") || return 1
+  [ -n "$entries" ] || return 0
+  if [ "$harness" = claude ]; then
+    declared=$(fm_worker_account_claude_selected "$entries" "$state")
+    token="$declared"$'\t'$(printf '%s\n' "$entries" | wc -l | tr -d '[:space:]')
+  else
+    token=$entries
+    declared=${token%%$'\t'*}
+  fi
+  cfg="$config/$file"
   root=$declared
   # shellcheck disable=SC2088  # The fallbacks are literal text for the refusal.
   case "$harness" in
@@ -217,17 +400,17 @@ fm_worker_account_check() {
   return 0
 }
 
-# fm_worker_account_select <harness> <config-dir> <model> <executable> [<raw-command>]
+# fm_worker_account_select <harness> <config-dir> <state-dir> <model> <executable> [<raw-command>]
 # The whole launch-time decision. Prints nothing for an unpinned runner, so
 # the caller keeps today's launch unchanged. For a pinned one prints
 # "declared<TAB>root<TAB>provider", where provider is the Pi launch model's
-# own (empty for Claude), after the model guard and the sign-in check pass. On
-# refusal prints one error and returns 1. bin/fm-spawn.sh runs it before any
-# endpoint exists, and bin/fm-control.sh before a relaunch stops the live
-# agent.
+# own (empty for Claude), after the model guard, the Claude allowlist, and the
+# sign-in check pass. On refusal prints one error and returns 1.
+# bin/fm-spawn.sh runs it before any endpoint exists, and bin/fm-control.sh
+# before a relaunch stops the live agent.
 fm_worker_account_select() {
-  local harness=$1 config=$2 model=$3 executable=$4 raw=${5:-} selection declared root providers word provider=
-  selection=$(fm_worker_account_resolve "$harness" "$config") || return 1
+  local harness=$1 config=$2 state=$3 model=$4 executable=$5 raw=${6:-} selection declared root providers word provider=
+  selection=$(fm_worker_account_resolve "$harness" "$config" "$state") || return 1
   [ -n "$selection" ] || return 0
   declared=${selection%%$'\t'*}
   root=${selection#*$'\t'}
@@ -263,6 +446,9 @@ fm_worker_account_select() {
       return 1
       ;;
     esac
+  fi
+  if [ "$harness" = claude ]; then
+    fm_worker_account_claude_allowed "$config" "$declared" "$root" "$providers" || return 1
   fi
   fm_worker_account_check "$harness" "$declared" "$root" "$executable" "$provider" || return 1
   printf '%s\t%s\t%s\n' "$declared" "$root" "$provider"

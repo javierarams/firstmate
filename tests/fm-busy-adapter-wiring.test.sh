@@ -235,7 +235,7 @@ run_claude_hook() {  # <settings.json> <hook-event>
 }
 
 test_claude_hooks_semantic_lifecycle() {
-  local rec id=busy-cl-1 out state settings
+  local rec id=busy-cl-1 out state settings cmd
   rec=$(make_spawn_case claude-lifecycle claude "$id")
   read_case_record "$rec"
   out=$(run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$id" "$PROJ_DIR")
@@ -264,12 +264,17 @@ test_claude_hooks_semantic_lifecycle() {
   run_claude_hook "$settings" StopFailure || fail "StopFailure hook command failed"
   out=$(classify claude "$id" "$state")
   [ "$out" = "idle claude-hook" ] || fail "StopFailure must classify idle so an API error cannot strand busy, got '$out'"
+  cmd=$(jq -r '.hooks.StopFailure[0].hooks[1].command' "$settings")
+  printf '{"hook_event_name":"StopFailure","error":"rate_limit","last_assistant_message":"API Error: Rate limit reached"}\n' |
+    sh -c "$cmd" || fail "StopFailure error-record hook command failed"
+  [ "$(cut -f2- "$state/$id.api-error")" = "$(cat "$state/$id.busy-gen")	rate_limit	API Error: Rate limit reached" ] ||
+    fail "StopFailure must record this incarnation's API error type, got '$(cat "$state/$id.api-error" 2>/dev/null)'"
 
   run_claude_hook "$settings" UserPromptSubmit
   run_claude_hook "$settings" SessionEnd || fail "SessionEnd hook command failed"
   out=$(classify claude "$id" "$state")
   [ "$out" = "idle claude-hook" ] || fail "SessionEnd must classify idle, got '$out'"
-  pass "claude hooks open on UserPromptSubmit and close on Stop, StopFailure, and SessionEnd"
+  pass "claude hooks open on UserPromptSubmit and close on Stop, StopFailure, and SessionEnd, and StopFailure records its error type"
 }
 
 test_claude_hooks_stale_incarnation_harmless() {

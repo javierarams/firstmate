@@ -638,6 +638,30 @@ skip-runner: pi-signed is not installed, so its pin check was not exercised
 
 The guard submits no prompt and spends no tokens, so it runs by default wherever a runner is installed; rerun it after every Claude or Pi upgrade.
 
+## Claude account rotation probe and StopFailure record
+
+`bin/fm-claude-account-rotate.sh` reads two vendor signals.
+Its live probe is one minimal `claude -p --output-format stream-json --verbose` turn, and its verdict is the `rate_limit_event`'s `rate_limit_info.status` (`allowed`, `allowed_warning`, or `rejected`) with `resetsAt`.
+A signed-in account answers `allowed` or `allowed_warning` with an epoch `resetsAt` and a non-error `result` for about a thousand tokens; a limited one answers `rejected`, a `result` with `is_error: true`, `api_error_status: 429`, and the text `You've hit your session limit · resets <time> (<zone>)`, for no tokens.
+The limited shape is recorded from a real limited run and from the step logs of no-mistakes runs that failed at the limit, because a limit cannot be provoked on demand.
+Its structural evidence is the `StopFailure` hook payload's `error` field, which `bin/fm-spawn.sh` records per incarnation; an unknown `--model` provokes a token-free `StopFailure` with `error: model_not_found`.
+`tests/fm-claude-account-rotation-live-e2e.test.sh` runs the rotation's own probe against a signed-in account and requires a verdict whose reset came from the event, then wires the rotation's own recorder as a `StopFailure` hook under `-p` and requires a documented error type in the record.
+
+Verified 2026-10-10 on Claude Code 2.1.296 on macOS against two signed-in subscription accounts.
+
+```sh
+FM_CLAUDE_ROTATION_LIVE_E2E=1 FM_CLAUDE_ROTATION_LIVE_ROOT=<signed-in config dir> FM_CLAUDE_ROTATION_LIVE_MODEL='opus[1m]' \
+  bash tests/fm-claude-account-rotation-live-e2e.test.sh
+```
+
+```
+ok - claude 2.1.296 (Claude Code): the rotation probe reads 'allowed 1791603600' for <config dir> from the stream's rate_limit_event
+ok - claude 2.1.296 (Claude Code): a StopFailure turn records error type 'model_not_found' for the current incarnation
+# claude account rotation live guard checked: claude 2.1.296 (Claude Code)
+```
+
+The probe spends tokens, so the guard is opt-in; rerun it after every Claude upgrade.
+
 ## Codex hook trust
 
 Verified 2026-09-16 on codex-cli 0.151.0, macOS arm64, in a fresh linked worktree of this repository.

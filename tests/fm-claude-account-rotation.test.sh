@@ -1,0 +1,820 @@
+#!/usr/bin/env bash
+# Behavior tests for automatic Claude account rotation
+# (bin/fm-claude-account-rotate.sh over the worker account pin's rotation pool
+# in bin/fm-worker-account-lib.sh).
+#
+# Each case builds a home whose config/claude-account lists a pool of fake
+# Claude roots. Every root carries a .claude.json naming its account email and,
+# when signed in, a .credentials.json. The fake claude answers `auth status`
+# from that login and answers the rotation's live probe with the stream-json a
+# real `claude -p` prints, allowed or rejected per the root's `probe` file, and
+# logs which root and model each probe used. Rotations drive the REAL
+# bin/fm-control.sh relaunch and bin/fm-spawn.sh --relaunch through a tmux stub
+# that models the agent lifecycle, so a relaunch is proven by the task record,
+# the instructions the replacement reads, and the account it launched on.
+# tests/fm-claude-account-rotation-live-e2e.test.sh proves the probe and the
+# StopFailure record against the real runner.
+set -u
+
+# shellcheck source=tests/lib.sh
+. "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
+# shellcheck source=bin/fm-worker-account-lib.sh
+. "$ROOT/bin/fm-worker-account-lib.sh"
+
+ROTATE="$ROOT/bin/fm-claude-account-rotate.sh"
+TMP_ROOT=$(fm_test_tmproot fm-claude-account-rotation)
+unset ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN
+FUTURE=4102444800
+
+# make_fakes <case-dir>: fake claude and the agent-lifecycle tmux stub.
+make_fakes() {
+  local dir=$1 fb="$1/fakebin"
+  mkdir -p "$fb"
+  cat > "$fb/claude" <<SH
+#!/usr/bin/env bash
+root=\${CLAUDE_CONFIG_DIR:-\$HOME/.claude}
+case "\${1:-}" in
+  auth) [ -f "\$root/.credentials.json" ]; exit ;;
+  -p)
+    model=none prev=
+    for a in "\$@"; do [ "\$prev" != --model ] || model=\$a; prev=\$a; done
+    printf '%s %s\n' "\${CLAUDE_CONFIG_DIR-unset}" "\$model" >> '$dir/probes'
+    verdict=\$(head -n 1 "\$root/probe" 2>/dev/null || echo allowed)
+    case "\$verdict" in
+      rejected*)
+        printf '{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","resetsAt":%s,"rateLimitType":"five_hour"}}\n' "\${verdict#rejected }"
+        printf '{"type":"result","is_error":true,"api_error_status":429,"result":"You%sve hit your session limit · resets 3pm (UTC)"}\n' "'"
+        exit 1 ;;
+      error) printf 'Network unreachable\n'; exit 1 ;;
+      *)
+        printf '{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","resetsAt":$FUTURE}}\n'
+        printf '{"type":"result","is_error":false,"subtype":"success","result":"OK"}\n'
+        exit 0 ;;
+    esac ;;
+esac
+exit 0
+SH
+  cat > "$fb/tmux" <<'SH'
+#!/usr/bin/env bash
+set -u
+D=$FM_FAKE_DIR
+case "${1:-}" in
+  send-keys)
+    shift
+    literal=0
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        -t) shift 2 ;;
+        -l) literal=1; shift ;;
+        *) break ;;
+      esac
+    done
+    payload=${1:-}
+    if [ "$literal" = 1 ]; then
+      case "$payload" in
+        ". '"*"'") staged=${payload#". '"}; staged=${staged%"'"}; [ ! -f "$staged" ] || payload=$(cat "$staged") ;;
+      esac
+      printf '%s\n' "$payload" >> "$D/literal"
+      case "$payload" in
+        /exit|/quit) printf 'zsh' > "$D/command" ;;
+        *'Firstmate operational input waiting: read'*) printf 'claude' > "$D/command" ;;
+      esac
+    fi
+    exit 0 ;;
+  display-message)
+    for a in "$@"; do
+      case "$a" in
+        *cursor_y*) printf '1\n'; exit 0 ;;
+        *pane_current_command*) cat "$D/command"; printf '\n'; exit 0 ;;
+        *pane_current_path*) cat "$D/cwd"; printf '\n'; exit 0 ;;
+      esac
+    done
+    printf 'fakepane\n'; exit 0 ;;
+  capture-pane) printf '╭────╮\n│    │\n╰────╯\n'; exit 0 ;;
+  list-windows) cat "$D/windows"; exit 0 ;;
+esac
+exit 0
+SH
+  cat > "$fb/sleep" <<'SH'
+#!/usr/bin/env bash
+exit 0
+SH
+  chmod +x "$fb/claude" "$fb/tmux" "$fb/sleep"
+}
+
+# claude_root <dir> <email> [signed-in|signed-out] [probe-verdict]
+claude_root() {
+  mkdir -p "$1"
+  printf '{"oauthAccount":{"emailAddress":"%s"}}\n' "$2" > "$1/.claude.json"
+  [ "${3:-signed-in}" = signed-out ] || printf '{}\n' > "$1/.credentials.json"
+  printf '%s\n' "${4:-allowed}" > "$1/probe"
+}
+
+# new_case <name> -> sets CASE HOME_DIR STATE ID WT; a live Claude ship whose
+# record names account=$CASE/a. Roots a, b, and c are signed in with distinct
+# allowed emails; the pool lists a then b.
+new_case() {
+  CASE="$TMP_ROOT/$1"
+  HOME_DIR="$CASE/home"
+  STATE="$HOME_DIR/state"
+  ID=rot-$1
+  WT="$CASE/wt"
+  mkdir -p "$STATE" "$HOME_DIR/data/$ID" "$HOME_DIR/config" "$CASE/fake" "$CASE/user-home"
+  make_fakes "$CASE"
+  fm_git_worktree "$CASE/proj" "$WT" "task-$ID"
+  claude_root "$CASE/a" a@example.com
+  claude_root "$CASE/b" b@example.com
+  claude_root "$CASE/c" c@example.com
+  printf '%s\n%s\n' "$CASE/a" "$CASE/b" > "$HOME_DIR/config/claude-account"
+  printf 'a@example.com\nB@Example.com\nc@example.com\n' > "$HOME_DIR/config/claude-account-allowlist"
+  printf '# Task\n## Captain'"'"'s intent\nKeep working.\n\n## Firstmate spec\nPreserve the task across relaunches.\n' > "$HOME_DIR/data/$ID/brief.md"
+  printf '%s\n' "$(fm_test_task_tmp_root "$ID")" >> "$TMP_ROOT/task-tmps"
+  fm_write_meta "$STATE/$ID.meta" \
+    "window=fmses:fm-$ID" "endpoint_task_id=$ID" "worktree=$WT" "project=$CASE/proj" \
+    "harness=claude" "kind=ship" "mode=no-mistakes" "yolo=off" "branch=fm/$ID" \
+    "tasktmp=$(fm_test_task_tmp_root "$ID")" "model=opus" "effort=high" "account=$CASE/a"
+  printf 'gen-1\n' > "$STATE/$ID.busy-gen"
+  printf 'working [at=1]: implementing\n' > "$STATE/$ID.status"
+  printf 'claude' > "$CASE/fake/command"
+  printf 'fm-%s\n' "$ID" > "$CASE/fake/windows"
+  printf '%s' "$WT" > "$CASE/fake/cwd"
+  : > "$CASE/fake/literal"
+  : > "$CASE/probes"
+}
+
+rotate() {  # <args...>
+  env -u HERDR_ENV -u HERDR_PANE_ID -u HERDR_SESSION -u HERDR_SOCKET_PATH \
+    -u HERDR_TAB_ID -u HERDR_WORKSPACE_ID -u CLAUDE_CONFIG_DIR \
+    PATH="$CASE/fakebin:$PATH" FM_HOME="$HOME_DIR" FM_FAKE_DIR="$CASE/fake" HOME="$CASE/user-home" \
+    FM_SPAWN_NO_GUARD=1 FM_CONTROL_POLL=0.01 FM_CONTROL_EXIT_WAIT=0.05 FM_CONTROL_LAUNCH_WAIT=0.05 \
+    "$ROTATE" "$@"
+}
+
+observe_pane() {  # [hash]
+  rotate observe "$ID" --pane-hash "${1:-h1}" --pane-line "You've hit your session limit · resets 3pm (UTC)"
+}
+
+# start_daemon_stand_in <claude-root> -> DAEMON_PID, DAEMON_ENV_VISIBLE
+# A long-running process whose environment names <claude-root>, standing in
+# for the no-mistakes daemon. macOS hides the environment of Apple platform
+# binaries from ps, so a node process is preferred where one is installed.
+start_daemon_stand_in() {
+  local env_text
+  DAEMON_ENV_VISIBLE=0
+  if command -v node >/dev/null 2>&1; then
+    env CLAUDE_CONFIG_DIR="$1" HOME="$CASE/user-home" node -e 'setTimeout(() => {}, 30000)' &
+  else
+    env CLAUDE_CONFIG_DIR="$1" HOME="$CASE/user-home" /bin/sleep 30 &
+  fi
+  DAEMON_PID=$!
+  sleep 0.5
+  if [ -r "/proc/$DAEMON_PID/environ" ]; then
+    env_text=$(tr '\0' '\n' < "/proc/$DAEMON_PID/environ")
+  else
+    env_text=$(ps eww -o command= -p "$DAEMON_PID" | tr ' ' '\n')
+  fi
+  printf '%s\n' "$env_text" | grep -qx "CLAUDE_CONFIG_DIR=$1" && DAEMON_ENV_VISIBLE=1
+  return 0
+}
+
+meta_field() {  # <key>
+  grep "^$1=" "$STATE/$ID.meta" | tail -1 | cut -d= -f2-
+}
+
+probe_count() {
+  grep -c . "$CASE/probes" || true
+}
+
+assert_not_relaunched() {  # <msg>
+  assert_equals "$CASE/a" "$(meta_field account)" "$1: the task record must keep its account"
+  assert_no_grep "Firstmate operational input waiting" "$CASE/fake/literal" "$1: no replacement may launch"
+  assert_no_grep "## Progress note" "$HOME_DIR/data/$ID/brief.md" "$1: the instructions must stay untouched"
+}
+
+test_no_pool_passes_untouched() {
+  local out
+  new_case no-pool
+  printf '%s\n' "$CASE/a" > "$HOME_DIR/config/claude-account"
+  out=$(observe_pane)
+  assert_equals pass "${out%%$'\t'*}" "a single pin is no rotation pool"
+  rm "$HOME_DIR/config/claude-account"
+  out=$(observe_pane)
+  assert_equals pass "${out%%$'\t'*}" "an absent pin is no rotation pool"
+  assert_equals 0 "$(probe_count)" "no pool must never probe an account"
+  assert_not_relaunched "without a pool"
+  pass "observe leaves a home without a rotation pool exactly as it was"
+}
+
+test_confirmed_limit_relaunches_on_the_next_account() {
+  local out note
+  new_case rotate
+  printf 'rejected 1900000000\n' > "$CASE/a/probe"
+  out=$(observe_pane)
+  assert_equals wake "${out%%$'\t'*}" "a confirmed limit with a usable next account must surface once: $out"
+  assert_contains "$out" "check: claude account rotated: $ID relaunched on $CASE/b (b@example.com) after a@example.com hit its usage limit" \
+    "the wake should name the task, the new account, and the limited one"
+  assert_equals "$CASE/b" "$(meta_field account)" "the relaunched task record should carry the new account"
+  assert_equals opus "$(meta_field model)" "the relaunch should keep the task's model"
+  assert_equals high "$(meta_field effort)" "the relaunch should keep the task's effort"
+  assert_equals "$WT" "$(meta_field worktree)" "the relaunch should keep the task's worktree"
+  assert_grep "Firstmate operational input waiting" "$CASE/fake/literal" "a replacement worker should launch"
+  note=$(cat "$HOME_DIR/data/$ID/brief.md")
+  assert_contains "$note" "## Progress note" "the replacement's instructions should carry a progress note"
+  assert_contains "$note" "usage limit of a@example.com" "the note should name the limited account"
+  assert_contains "$note" "relaunched it on $CASE/b (b@example.com)" "the note should name the new account"
+  assert_equals "$CASE/b" "$(head -n 1 "$STATE/claude-account-rotation/selected")" \
+    "the rotation should make the new account the selection new spawns use"
+  assert_grep "a@example.com	1900000000	" "$STATE/claude-account-rotation/limited" \
+    "the limited account should be recorded with its reset"
+  assert_equals "$CASE/a opus
+$CASE/b opus" "$(cat "$CASE/probes")" "the probes should confirm the old account and clear the new one with the task's model"
+  pass "a confirmed usage limit relaunches the worker on the next usable account and records it"
+}
+
+test_unlimited_account_dismisses_the_evidence() {
+  local out
+  new_case dismiss
+  out=$(observe_pane h1)
+  assert_equals pass "${out%%$'\t'*}" "an account the service still allows is no usage limit: $out"
+  assert_not_relaunched "a dismissed limit"
+  assert_equals 1 "$(probe_count)" "the dismissal should cost one probe"
+  out=$(observe_pane h1)
+  assert_equals pass "${out%%$'\t'*}" "the same dismissed evidence must pass again"
+  assert_equals 1 "$(probe_count)" "the same dismissed evidence must not be probed again"
+  printf 'rejected 1900000000\n' > "$CASE/a/probe"
+  out=$(observe_pane h2)
+  assert_equals wake "${out%%$'\t'*}" "new evidence that the service confirms must rotate: $out"
+  pass "a limit line the service does not confirm is dismissed once and never relaunches"
+}
+
+test_every_account_limited_declares_one_timed_wait() {
+  local out status until_iso
+  new_case all-limited
+  printf 'rejected 1900000600\n' > "$CASE/a/probe"
+  printf 'rejected 1900000000\n' > "$CASE/b/probe"
+  out=$(observe_pane)
+  assert_equals wake "${out%%$'\t'*}" "an all-limited pool must surface once: $out"
+  assert_contains "$out" "check: claude usage limit: $ID stopped on a@example.com and every pool account is limited" \
+    "the wake should say every account is limited"
+  until_iso=$(date -u -r 1900000060 +%Y-%m-%dT%H:%MZ 2>/dev/null || date -u -d @1900000060 +%Y-%m-%dT%H:%MZ)
+  assert_contains "$out" "retries at $until_iso" "the wait should end at the earliest known reset"
+  assert_not_relaunched "an all-limited pool"
+  status=$(tail -n 1 "$STATE/$ID.status")
+  assert_contains "$status" "paused [key=claude-usage-limit] [at=" "the wait should be declared as a keyed pause"
+  assert_contains "$status" "until $until_iso" "the declared pause should carry its UTC clearing time"
+  out=$(observe_pane)
+  assert_equals absorb "${out%%$'\t'*}" "a standing wait must not alarm again: $out"
+  assert_equals 2 "$(probe_count)" "a standing wait must not probe again"
+  assert_equals 1 "$(grep -c 'paused \[key=claude-usage-limit\]' "$STATE/$ID.status")" "the wait must be declared once"
+  pass "an all-limited pool keeps the worker in place and declares one wait until the earliest reset"
+}
+
+test_expired_wait_resumes_and_resolves_the_pause() {
+  local out
+  new_case resume
+  printf 'rejected 1900000600\n' > "$CASE/a/probe"
+  printf 'rejected 1900000000\n' > "$CASE/b/probe"
+  out=$(observe_pane)
+  assert_equals wake "${out%%$'\t'*}" "the first sight should surface the wait: $out"
+  # The reset has passed: both accounts answer allowed and the recorded resets
+  # are in the past.
+  printf 'allowed\n' > "$CASE/a/probe"
+  printf 'allowed\n' > "$CASE/b/probe"
+  printf 'a@example.com\t1000\t900\nb@example.com\t1000\t900\n' > "$STATE/claude-account-rotation/limited"
+  sed -i.bak 's/^until=.*/until=1000/' "$STATE/claude-account-rotation/episode-$ID" && rm -f "$STATE/claude-account-rotation/episode-$ID.bak"
+  out=$(observe_pane)
+  assert_equals wake "${out%%$'\t'*}" "an expired wait with a usable account must resume the worker: $out"
+  assert_contains "$out" "check: claude account rotated: $ID relaunched on $CASE/a (a@example.com)" \
+    "the worker should resume on the first usable account from the selection"
+  assert_equals "$CASE/a" "$(meta_field account)" "the resumed task record should carry its account"
+  assert_contains "$(tail -n 1 "$STATE/$ID.status")" "resolved [key=claude-usage-limit] [at=" \
+    "resuming should resolve the declared pause"
+  assert_absent "$STATE/claude-account-rotation/episode-$ID" "a resumed episode should be closed"
+  pass "an expired wait retries, resumes the worker when an account frees, and resolves its pause"
+}
+
+busy_record() {  # <seq> <state> [ts]
+  printf 'v1 gen=gen-1 seq=%s state=%s source=claude-hook event=hook ts=%s\n' "$1" "$2" "${3:-1}" > "$STATE/$ID.busy-state"
+}
+
+# wait_on_stop_failure: an all-limited pool waits on a StopFailure record while
+# the worker's busy record says idle at seq 4, then the wait expires with both
+# accounts free again.
+wait_on_stop_failure() {
+  local out
+  busy_record 4 idle
+  printf 'rejected 1900000600\n' > "$CASE/a/probe"
+  printf 'rejected 1900000000\n' > "$CASE/b/probe"
+  printf '{"error":"rate_limit","last_assistant_message":"API Error"}\n' | "$ROTATE" record-stop-failure "$STATE" "$ID" --gen gen-1
+  out=$(rotate observe "$ID")
+  assert_equals wake "${out%%$'\t'*}" "the first sight should surface the wait: $out"
+  printf 'allowed\n' > "$CASE/a/probe"
+  printf 'allowed\n' > "$CASE/b/probe"
+  printf 'a@example.com\t1000\t900\nb@example.com\t1000\t900\n' > "$STATE/claude-account-rotation/limited"
+  sed -i.bak 's/^until=.*/until=1000/' "$STATE/claude-account-rotation/episode-$ID" && rm -f "$STATE/claude-account-rotation/episode-$ID.bak"
+}
+
+test_expired_wait_retries_a_worker_still_stopped() {
+  local out
+  new_case still-stopped
+  wait_on_stop_failure
+  out=$(rotate observe "$ID")
+  assert_equals wake "${out%%$'\t'*}" "a worker idle at the same busy seq must be retried without a pane line: $out"
+  assert_contains "$out" "check: claude account rotated: $ID relaunched on $CASE/a (a@example.com)" \
+    "the retry should resume the worker on the first usable account"
+  assert_contains "$(tail -n 1 "$STATE/$ID.status")" "resolved [key=claude-usage-limit] [at=" \
+    "resuming should resolve the declared pause"
+  pass "an expired wait retries a worker whose busy record shows no turn since, with no pane line"
+}
+
+test_expired_wait_retries_a_worker_limited_again_during_the_wait() {
+  local out
+  new_case limited-again
+  wait_on_stop_failure
+  sed -i.bak 's/^until=.*/until=1900000000/' "$STATE/claude-account-rotation/episode-$ID" && rm -f "$STATE/claude-account-rotation/episode-$ID.bak"
+  busy_record 5 busy
+  busy_record 6 idle
+  printf '{"error":"rate_limit","last_assistant_message":"API Error"}\n' | "$ROTATE" record-stop-failure "$STATE" "$ID" --gen gen-1
+  out=$(rotate observe "$ID")
+  assert_equals absorb "${out%%$'\t'*}" "a new limit hit during the wait keeps the wait: $out"
+  assert_not_relaunched "a limit hit again before the wait expires"
+  sed -i.bak 's/^until=.*/until=1000/' "$STATE/claude-account-rotation/episode-$ID" && rm -f "$STATE/claude-account-rotation/episode-$ID.bak"
+  out=$(rotate observe "$ID")
+  assert_equals wake "${out%%$'\t'*}" "a worker stopped again at the limit must be retried at expiry: $out"
+  assert_contains "$out" "check: claude account rotated: $ID relaunched on $CASE/a (a@example.com)" \
+    "the retry should resume the worker on the first usable account"
+  pass "a worker that hits the limit again during its wait is retried against its latest stop"
+}
+
+test_expired_wait_leaves_a_resumed_worker_alone() {
+  local out state
+  for state in "5 idle" "4 busy"; do
+    new_case "resumed-${state% *}"
+    wait_on_stop_failure
+    busy_record "${state% *}" "${state#* }"
+    out=$(rotate observe "$ID")
+    assert_equals pass "${out%%$'\t'*}" "a worker whose busy record moved to $state must not be retried: $out"
+    assert_not_relaunched "a worker that took a turn during its wait"
+    assert_equals 2 "$(probe_count)" "a resumed worker must not be probed again"
+    assert_contains "$(tail -n 1 "$STATE/$ID.status")" "resolved [key=claude-usage-limit] [at=" \
+      "ending the wait should resolve the declared pause"
+    out=$(rotate observe "$ID")
+    assert_equals pass "${out%%$'\t'*}" "the ended wait must stay quiet: $out"
+  done
+  pass "an expired wait whose worker took a turn since ends without relaunching it"
+}
+
+expire_wait() {
+  sed -i.bak 's/^until=.*/until=1000/' "$STATE/claude-account-rotation/episode-$ID" && rm -f "$STATE/claude-account-rotation/episode-$ID.bak"
+}
+
+assert_wait_ended_untouched() {  # <out> <msg> [probes]
+  assert_equals pass "${1%%$'\t'*}" "$2: the expired wait must pass the worker back: $1"
+  assert_not_relaunched "$2"
+  assert_equals "${3:-2}" "$(probe_count)" "$2: a resumed worker must not be probed again"
+  assert_contains "$(tail -n 1 "$STATE/$ID.status")" "resolved [key=claude-usage-limit] [at=" "$2: ending the wait should resolve the declared pause"
+}
+
+test_expired_wait_ignores_an_old_limit_line_on_a_resumed_worker() {
+  local out
+  new_case old-line
+  wait_on_stop_failure
+  busy_record 5 idle
+  out=$(observe_pane h9)
+  assert_wait_ended_untouched "$out" "a worker that took a turn while its old limit line is still on its pane"
+  assert_contains "$out" "the worker took a turn since it stopped at the Claude usage limit" "the pass should say why"
+  out=$(observe_pane h9)
+  assert_equals pass "${out%%$'\t'*}" "the same old limit line must stay quiet: $out"
+  assert_equals 2 "$(probe_count)" "the same old limit line must not be probed again"
+
+  new_case old-line-during-wait
+  wait_on_stop_failure
+  sed -i.bak 's/^until=.*/until=1900000000/' "$STATE/claude-account-rotation/episode-$ID" && rm -f "$STATE/claude-account-rotation/episode-$ID.bak"
+  busy_record 5 busy
+  busy_record 6 idle
+  out=$(observe_pane h9)
+  assert_equals absorb "${out%%$'\t'*}" "a limit line seen during the wait keeps the wait: $out"
+  out=$(observe_pane h9)
+  assert_equals absorb "${out%%$'\t'*}" "a limit line seen again during the wait keeps the wait: $out"
+  expire_wait
+  out=$(observe_pane h9)
+  assert_wait_ended_untouched "$out" "a limit line after a turn the worker finished is no new stop"
+  pass "an expired wait leaves alone a worker that took a turn, even while an old limit line is on its pane"
+}
+
+test_stop_failure_read_mid_hook_keeps_the_stop() {
+  local out
+  new_case mid-hook
+  wait_on_stop_failure
+  sed -i.bak 's/^until=.*/until=1900000000/' "$STATE/claude-account-rotation/episode-$ID" && rm -f "$STATE/claude-account-rotation/episode-$ID.bak"
+  busy_record 5 busy
+  printf '{"error":"rate_limit","last_assistant_message":"API Error"}\n' | "$ROTATE" record-stop-failure "$STATE" "$ID" --gen gen-1
+  out=$(rotate observe "$ID")
+  assert_equals absorb "${out%%$'\t'*}" "a limit hit read before its idle event keeps the wait: $out"
+  busy_record 6 idle
+  expire_wait
+  out=$(rotate observe "$ID")
+  assert_contains "$out" "check: claude account rotated: $ID relaunched on $CASE/a (a@example.com)" \
+    "the stop whose idle event landed after the read must be retried at expiry"
+  pass "a StopFailure record read before its idle event snapshots the idle stop it is about to record"
+}
+
+test_turn_started_after_a_stop_failure_is_a_resume() {
+  local out
+  new_case turn-after-stop
+  wait_on_stop_failure
+  sed -i.bak 's/^until=.*/until=1900000000/' "$STATE/claude-account-rotation/episode-$ID" && rm -f "$STATE/claude-account-rotation/episode-$ID.bak"
+  busy_record 6 idle
+  printf '{"error":"rate_limit","last_assistant_message":"API Error"}\n' | "$ROTATE" record-stop-failure "$STATE" "$ID" --gen gen-1
+  busy_record 7 busy "$FUTURE"
+  out=$(rotate observe "$ID")
+  assert_equals absorb "${out%%$'\t'*}" "a limit hit during the wait keeps the wait: $out"
+  busy_record 8 idle "$FUTURE"
+  expire_wait
+  out=$(rotate observe "$ID")
+  assert_wait_ended_untouched "$out" "a worker whose new turn began after its latest stop"
+  pass "a busy mark later than the StopFailure record is a new turn, not the stop's pending idle event"
+}
+
+test_new_limit_line_after_a_finished_turn_is_a_resume() {
+  local out
+  new_case line-after-turn
+  busy_record 4 idle
+  printf 'rejected 1900000600\n' > "$CASE/a/probe"
+  printf 'rejected 1900000000\n' > "$CASE/b/probe"
+  out=$(observe_pane h1)
+  assert_equals wake "${out%%$'\t'*}" "the first sight should surface the wait: $out"
+  busy_record 6 idle
+  out=$(observe_pane h2)
+  assert_equals absorb "${out%%$'\t'*}" "a new limit line during the wait keeps the wait: $out"
+  out=$(observe_pane h2)
+  assert_equals absorb "${out%%$'\t'*}" "the same line keeps the wait: $out"
+  printf 'allowed\n' > "$CASE/a/probe"
+  printf 'allowed\n' > "$CASE/b/probe"
+  printf 'a@example.com\t1000\t900\nb@example.com\t1000\t900\n' > "$STATE/claude-account-rotation/limited"
+  expire_wait
+  out=$(observe_pane h2)
+  assert_wait_ended_untouched "$out" "a worker that finished a turn while its account is limited again"
+  assert_contains "$out" "the worker took a turn since it stopped at the Claude usage limit" "the pass should say why"
+  pass "a new limit line after a turn the worker finished cleanly does not refresh the wait"
+}
+
+# wait_on_pane_then_new_line <h2-probe>: an all-limited pool waits on pane h1
+# with no StopFailure or busy record; the worker resumes and a new limit line h2
+# appears while its own account answers <h2-probe>.
+wait_on_pane_then_new_line() {
+  local out
+  printf 'rejected 1900000600\n' > "$CASE/a/probe"
+  printf 'rejected 1900000000\n' > "$CASE/b/probe"
+  out=$(observe_pane h1)
+  assert_equals wake "${out%%$'\t'*}" "the first sight should surface the wait: $out"
+  printf '%s\n' "$1" > "$CASE/a/probe"
+  out=$(observe_pane h2)
+  assert_equals absorb "${out%%$'\t'*}" "a new limit line during the wait keeps the wait: $out"
+  assert_equals 3 "$(probe_count)" "a new limit line must be confirmed by one probe of the worker's own account"
+  out=$(observe_pane h2)
+  assert_equals absorb "${out%%$'\t'*}" "the same new line keeps the wait: $out"
+  assert_equals 3 "$(probe_count)" "one pane hash must be probed at most once"
+  printf 'allowed\n' > "$CASE/a/probe"
+  printf 'allowed\n' > "$CASE/b/probe"
+  printf 'a@example.com\t1000\t900\nb@example.com\t1000\t900\n' > "$STATE/claude-account-rotation/limited"
+  expire_wait
+}
+
+test_expired_wait_reads_a_new_limit_line_through_the_probe() {
+  local out
+  new_case new-line-rejected
+  wait_on_pane_then_new_line "rejected 1900000600"
+  out=$(observe_pane h2)
+  assert_contains "$out" "check: claude account rotated: $ID relaunched on $CASE/a (a@example.com)" \
+    "a new limit line its account confirmed must be retried at expiry"
+
+  new_case new-line-allowed
+  wait_on_pane_then_new_line allowed
+  out=$(observe_pane h2)
+  assert_wait_ended_untouched "$out" "a new limit line its account answered allowed to" 3
+  assert_contains "$out" "the worker's pane changed since it stopped at the Claude usage limit" "the pass should say why"
+  pass "a new limit line during a wait refreshes it only when the worker's own account is still limited"
+}
+
+test_expired_wait_leaves_a_busy_window_alone() {
+  local out
+  new_case window-busy
+  wait_on_stop_failure
+  out=$(rotate observe "$ID" --pane-hash h1 --window-busy)
+  assert_wait_ended_untouched "$out" "a worker the watcher sees busy"
+  assert_contains "$out" "the worker is busy again" "the pass should say why"
+  pass "an expired wait leaves alone a worker the watcher classifies busy"
+}
+
+test_expired_wait_without_busy_record_reads_the_pane() {
+  local out
+  new_case pane-changed
+  printf 'rejected 1900000600\n' > "$CASE/a/probe"
+  printf 'rejected 1900000000\n' > "$CASE/b/probe"
+  out=$(observe_pane h1)
+  assert_equals wake "${out%%$'\t'*}" "the first sight should surface the wait: $out"
+  printf 'allowed\n' > "$CASE/a/probe"
+  printf 'allowed\n' > "$CASE/b/probe"
+  printf 'a@example.com\t1000\t900\nb@example.com\t1000\t900\n' > "$STATE/claude-account-rotation/limited"
+  expire_wait
+  out=$(rotate observe "$ID" --pane-hash h2)
+  assert_wait_ended_untouched "$out" "a worker with no busy record whose pane changed"
+  assert_contains "$out" "the worker's pane changed since it stopped at the Claude usage limit" "the pass should say why"
+
+  new_case pane-unknown
+  printf 'rejected 1900000600\n' > "$CASE/a/probe"
+  printf 'rejected 1900000000\n' > "$CASE/b/probe"
+  out=$(observe_pane h1)
+  expire_wait
+  out=$(rotate observe "$ID")
+  assert_wait_ended_untouched "$out" "a worker with no busy record and no pane to compare"
+  pass "without a busy record an expired wait relaunches only a worker whose pane is unchanged"
+}
+
+test_unprobeable_own_account_needs_the_service_verdict() {
+  local out
+  new_case unrecorded
+  sed -i.bak '/^account=/d' "$STATE/$ID.meta" && rm -f "$STATE/$ID.meta.bak"
+  out=$(observe_pane)
+  assert_equals wake "${out%%$'\t'*}" "a pane line with no account to probe should surface: $out"
+  assert_contains "$out" "check: claude usage limit unconfirmed for $ID" "the wake should say the limit is unconfirmed"
+  assert_equals "" "$(meta_field account)" "the task record must not gain an account"
+  assert_no_grep "Firstmate operational input waiting" "$CASE/fake/literal" "no replacement may launch on a pane line alone"
+  assert_equals 0 "$(probe_count)" "nothing could be probed for an unrecorded account"
+  out=$(observe_pane h2)
+  assert_equals pass "${out%%$'\t'*}" "the unconfirmed episode must not alarm again: $out"
+
+  new_case unrecorded-stop-failure
+  sed -i.bak '/^account=/d' "$STATE/$ID.meta" && rm -f "$STATE/$ID.meta.bak"
+  printf '{"error":"rate_limit","last_assistant_message":"API Error"}\n' | "$ROTATE" record-stop-failure "$STATE" "$ID" --gen gen-1
+  out=$(rotate observe "$ID")
+  assert_equals wake "${out%%$'\t'*}" "a rate_limit record with no account to probe should surface: $out"
+  assert_contains "$out" "check: claude usage limit unconfirmed for $ID: Claude reported a rate_limit API error ('API Error') but its account is not recorded or readable, so no live probe could confirm the limit" \
+    "the wake should say no live probe confirmed the limit"
+  assert_equals "" "$(meta_field account)" "an unconfirmed rate_limit record must not relaunch the worker"
+  assert_no_grep "Firstmate operational input waiting" "$CASE/fake/literal" "no replacement may launch without a confirming probe"
+  assert_equals 0 "$(probe_count)" "nothing could be probed for an unrecorded account"
+
+  new_case disallowed-own
+  claude_root "$CASE/x" intruder@example.org
+  sed -i.bak "s|^account=.*|account=$CASE/x|" "$STATE/$ID.meta" && rm -f "$STATE/$ID.meta.bak"
+  out=$(observe_pane)
+  assert_equals wake "${out%%$'\t'*}" "a worker on a disallowed account must surface: $out"
+  assert_contains "$out" "check: claude account rotation stopped: $ID runs on intruder@example.org" "the wake should name the disallowed email"
+  assert_equals "$CASE/x" "$(meta_field account)" "the task record must keep its account"
+  assert_no_grep "Firstmate operational input waiting" "$CASE/fake/literal" "a disallowed account's worker must not be relaunched"
+  assert_equals 0 "$(probe_count)" "a disallowed account must never be probed"
+  pass "without a probeable allowed own account nothing relaunches, whatever the pane or API-error record shows, and a disallowed account is named"
+}
+
+test_same_email_directories_are_one_account() {
+  local out
+  new_case same-email
+  claude_root "$CASE/a2" a@example.com signed-in allowed
+  printf '%s\n%s\n%s\n' "$CASE/a" "$CASE/a2" "$CASE/b" > "$HOME_DIR/config/claude-account"
+  printf 'rejected 1900000000\n' > "$CASE/a/probe"
+  out=$(observe_pane)
+  assert_equals wake "${out%%$'\t'*}" "rotation should proceed past the shared account: $out"
+  assert_equals "$CASE/b" "$(meta_field account)" "a second directory of the limited email must be skipped"
+  assert_no_grep "$CASE/a2 " "$CASE/probes" "a directory sharing the limited email must not be probed"
+  pass "directories signed in to one email share its limit and are skipped together"
+}
+
+test_signed_out_and_unprobeable_accounts_are_skipped() {
+  local out
+  new_case skip
+  printf '%s\n%s\n%s\n' "$CASE/a" "$CASE/b" "$CASE/c" > "$HOME_DIR/config/claude-account"
+  rm "$CASE/b/.credentials.json"
+  printf 'rejected 1900000000\n' > "$CASE/a/probe"
+  out=$(observe_pane)
+  assert_equals "$CASE/c" "$(meta_field account)" "a signed-out account must be skipped: $out"
+  assert_no_grep "$CASE/b " "$CASE/probes" "a signed-out account must not be probed"
+
+  new_case skip-error
+  printf '%s\n%s\n%s\n' "$CASE/a" "$CASE/b" "$CASE/c" > "$HOME_DIR/config/claude-account"
+  printf 'rejected 1900000000\n' > "$CASE/a/probe"
+  printf 'error\n' > "$CASE/b/probe"
+  out=$(observe_pane)
+  assert_equals "$CASE/c" "$(meta_field account)" "an account whose probe fails must be skipped: $out"
+  pass "signed-out accounts and failed probes are skipped for the next usable account"
+}
+
+test_unlisted_account_stops_the_rotation() {
+  local out
+  new_case unlisted
+  claude_root "$CASE/b" intruder@example.org
+  printf 'rejected 1900000000\n' > "$CASE/a/probe"
+  out=$(observe_pane)
+  assert_equals wake "${out%%$'\t'*}" "an unlisted pool account must surface as a blocker: $out"
+  assert_contains "$out" "check: claude account rotation stopped: pool entry $CASE/b is signed in as intruder@example.org, which config/claude-account-allowlist does not list" \
+    "the blocker should name the entry and its account"
+  assert_not_relaunched "an unlisted pool account"
+  assert_equals 0 "$(probe_count)" "a blocked rotation must not probe any account"
+  out=$(observe_pane)
+  assert_equals absorb "${out%%$'\t'*}" "a standing block must not alarm again: $out"
+  claude_root "$CASE/b" b@example.com
+  sed -i.bak 's/^until=.*/until=1000/' "$STATE/claude-account-rotation/episode-$ID" && rm -f "$STATE/claude-account-rotation/episode-$ID.bak"
+  out=$(observe_pane)
+  assert_equals wake "${out%%$'\t'*}" "a fixed pool should rotate on the retry: $out"
+  assert_equals "$CASE/b" "$(meta_field account)" "the retry should relaunch on the fixed account"
+  assert_absent "$STATE/claude-account-rotation/blocked" "a fixed pool should clear the standing block"
+
+  new_case no-allowlist
+  rm "$HOME_DIR/config/claude-account-allowlist"
+  out=$(observe_pane)
+  assert_contains "$out" "config/claude-account-allowlist is missing" "a pool without an allowlist must stop the rotation"
+  assert_not_relaunched "a pool without an allowlist"
+  pass "an account outside the allowlist, or a missing allowlist, stops the rotation once until the pool is fixed"
+}
+
+test_unconfirmed_probe_surfaces_without_acting() {
+  local out
+  new_case unconfirmed
+  printf 'error\n' > "$CASE/a/probe"
+  out=$(observe_pane)
+  assert_equals wake "${out%%$'\t'*}" "a limit the probe cannot confirm should surface: $out"
+  assert_contains "$out" "check: claude usage limit unconfirmed for $ID" "the wake should say the limit is unconfirmed"
+  assert_not_relaunched "an unconfirmed limit"
+  out=$(observe_pane h2)
+  assert_equals pass "${out%%$'\t'*}" "an unconfirmed episode must not alarm again: $out"
+  pass "a limit the live probe cannot confirm surfaces once and relaunches nothing"
+}
+
+test_stop_failure_record_is_structural_evidence() {
+  local out
+  new_case stop-failure
+  printf 'rejected 1900000000\n' > "$CASE/a/probe"
+  printf '{"hook_event_name":"StopFailure","error":"rate_limit","last_assistant_message":"You%sve hit your session limit\\n· resets 3pm"}\n' "'" |
+    "$ROTATE" record-stop-failure "$STATE" "$ID" --gen gen-0
+  [ "$(cut -f2,3 "$STATE/$ID.api-error")" = "gen-0	rate_limit" ] || fail "the hook should record its generation and error: $(cat "$STATE/$ID.api-error")"
+  out=$(rotate observe "$ID")
+  assert_equals pass "${out%%$'\t'*}" "a record from an earlier agent incarnation is no evidence: $out"
+  assert_absent "$STATE/$ID.api-error" "an observed record should be consumed"
+  printf '{"error":"overloaded"}\n' | "$ROTATE" record-stop-failure "$STATE" "$ID" --gen gen-1
+  out=$(rotate observe "$ID")
+  assert_equals pass "${out%%$'\t'*}" "an API error other than rate_limit is no usage-limit evidence: $out"
+  printf '{"error":"rate_limit","last_assistant_message":"API Error"}\n' | "$ROTATE" record-stop-failure "$STATE" "$ID" --gen gen-1
+  out=$(rotate observe "$ID")
+  assert_equals wake "${out%%$'\t'*}" "a rate_limit record of the current agent should rotate without any pane line: $out"
+  assert_equals "$CASE/b" "$(meta_field account)" "the StopFailure-evidenced rotation should relaunch on the next account"
+  printf 'not json' | "$ROTATE" record-stop-failure "$STATE" ../escape --gen x
+  expect_code 0 $? "the hook must never fail Claude's lifecycle"
+
+  new_case stop-failure-allowed
+  printf '{"error":"rate_limit","last_assistant_message":"API Error"}\n' | "$ROTATE" record-stop-failure "$STATE" "$ID" --gen gen-1
+  out=$(rotate observe "$ID")
+  assert_equals pass "${out%%$'\t'*}" "a rate_limit record the live probe does not confirm must not rotate: $out"
+  assert_not_relaunched "an unconfirmed rate_limit record"
+  assert_equals "$CASE/a opus" "$(cat "$CASE/probes")" "the record should be checked against the worker's own account first"
+  pass "a StopFailure rate_limit record of the current agent triggers the probe, which alone decides, and a stale or unrelated one is not evidence"
+}
+
+test_default_model_probes_with_the_root_settings_model() {
+  local out
+  new_case default-model
+  sed -i.bak 's/^model=opus$/model=default/' "$STATE/$ID.meta" && rm -f "$STATE/$ID.meta.bak"
+  printf '{"model":"sonnet[1m]"}\n' > "$CASE/a/settings.json"
+  printf 'rejected 1900000000\n' > "$CASE/a/probe"
+  out=$(observe_pane)
+  assert_equals wake "${out%%$'\t'*}" "a default-model task should still rotate: $out"
+  assert_equals "$CASE/a sonnet[1m]
+$CASE/b none" "$(cat "$CASE/probes")" \
+    "a default-model probe should use the model each root's settings name, and no model when none is named"
+  pass "a task on the default model is probed with the model each account's settings choose"
+}
+
+test_status_and_select() {
+  local out
+  new_case status
+  out=$(rotate status)
+  assert_contains "$out" "pool: 2 entries; selected $CASE/a" "status should show the pool and the selection"
+  assert_contains "$out" "* $CASE/a  a@example.com allowed" "status should mark the selected entry"
+  assert_contains "$out" "  $CASE/b  b@example.com allowed" "status should list every entry with its email"
+  out=$(rotate select "$CASE/b")
+  assert_contains "$out" "selected $CASE/b" "select should record a pool entry"
+  assert_equals "$CASE/b" "$(head -n 1 "$STATE/claude-account-rotation/selected")" "select should write the selection"
+  out=$(rotate select "$CASE/c" 2>&1)
+  expect_code 1 $? "select must refuse an entry outside the pool"
+  assert_contains "$out" "is not an entry of config/claude-account" "the refusal should say why"
+  pass "status reports the pool and select records only a pool entry"
+}
+
+test_validation_scan_reports_a_daemon_limit_once() {
+  local out nm sleeper
+  new_case validation
+  if ! command -v sqlite3 >/dev/null 2>&1; then
+    echo "skip-case: sqlite3 is not installed, so the no-mistakes state database cannot be built"
+    return 0
+  fi
+  nm="$CASE/nm"
+  mkdir -p "$nm/logs/RUN1" "$nm/logs/RUN2"
+  sqlite3 "$nm/state.sqlite" "
+    create table runs (id text primary key, branch text, status text, error text, updated_at integer);
+    create table step_results (id text primary key, run_id text, step_name text, step_order integer, status text, log_path text);
+    insert into runs values ('RUN1', 'fm/$ID', 'failed', 'step test failed: agent run tests: claude exited: exit status 1: ', $(date +%s));
+    insert into step_results values ('s1', 'RUN1', 'test', 3, 'failed', '');
+    insert into runs values ('RUN2', 'fm/$ID', 'failed', 'step lint failed: lint exited 2', $(date +%s));
+    insert into step_results values ('s2', 'RUN2', 'lint', 2, 'failed', '');
+    insert into runs values ('RUN3', 'fm/other-home-task', 'failed', 'agent: claude exited', $(date +%s));"
+  printf 'claude started pid=1\n\nYou%sve hit your session limit · resets 7:40pm (America/Montevideo)\nclaude exited pid=1 error=claude exited: exit status 1:\n' "'" > "$nm/logs/RUN1/test.log"
+  printf 'lint failed\n' > "$nm/logs/RUN2/lint.log"
+  printf 'rejected 1900000000\n' > "$CASE/a/probe"
+  start_daemon_stand_in "$CASE/a"
+  sleeper=$DAEMON_PID
+  printf '%s\n' "$sleeper" > "$nm/daemon.pid"
+  out=$(NM_HOME="$nm" rotate validation-scan)
+  kill "$sleeper" 2>/dev/null
+  wait "$sleeper" 2>/dev/null
+  assert_equals 1 "$(printf '%s\n' "$out" | grep -c '^wake')" "exactly one run hit the usage limit: $out"
+  assert_contains "$out" "check: no-mistakes validation RUN1 for $ID failed when its Claude agent hit the usage limit in the test step (You've hit your session limit · resets 7:40pm (America/Montevideo))" \
+    "the report should name the run, the task, the step, and the limit line"
+  if [ "$DAEMON_ENV_VISIBLE" = 1 ]; then
+    assert_contains "$out" "the shared no-mistakes daemon runs Claude on $CASE/a (a@example.com), limited until" \
+      "the report should name the daemon's account and its reset"
+  else
+    echo "skip-case: no stand-in process on this host exposes its environment, so only the unreadable-account wording is checked"
+    assert_contains "$out" "the shared no-mistakes daemon's Claude account could not be read from its process" \
+      "an unreadable daemon environment should be reported as unknown, never guessed"
+  fi
+  assert_contains "$out" "next usable pool account: $CASE/b (b@example.com)" "the report should name the next usable account"
+  assert_not_contains "$out" RUN3 "a run on another home's branch must not be reported"
+  out=$(NM_HOME="$nm" rotate validation-scan)
+  assert_equals "" "$out" "a reported run must not be reported again"
+  assert_not_relaunched "a validation scan"
+
+  claude_root "$CASE/outside" outside@example.org
+  sqlite3 "$nm/state.sqlite" "
+    insert into runs values ('RUN4', 'fm/$ID', 'failed', 'agent review: claude exited: exit status 1: ', $(date +%s));
+    insert into step_results values ('s4', 'RUN4', 'review', 2, 'failed', '');"
+  mkdir -p "$nm/logs/RUN4"
+  printf 'You%sve hit your session limit · resets 9pm (UTC)\n' "'" > "$nm/logs/RUN4/review.log"
+  start_daemon_stand_in "$CASE/outside"
+  sleeper=$DAEMON_PID
+  printf '%s\n' "$sleeper" > "$nm/daemon.pid"
+  out=$(NM_HOME="$nm" rotate validation-scan)
+  kill "$sleeper" 2>/dev/null
+  wait "$sleeper" 2>/dev/null
+  if [ "$DAEMON_ENV_VISIBLE" = 1 ]; then
+    assert_contains "$out" "(outside@example.org), an account config/claude-account-allowlist does not list, so it was not probed" \
+      "a daemon account outside the allowlist should be named and never probed"
+  fi
+  assert_no_grep "$CASE/outside " "$CASE/probes" "a daemon account outside the allowlist must never be probed"
+  pass "a no-mistakes run that died at its daemon agent's usage limit is reported once with the daemon's account and the next usable one"
+}
+
+test_limit_line_matcher() {
+  local line
+  for line in "  ⎿  You've hit your session limit · resets 1:40am (America/Montevideo)" \
+    "│ You’ve hit your weekly limit · resets Oct 12 │" \
+    "Claude AI usage limit reached|1752339600" \
+    "● 5-hour limit reached ∙ resets 3pm" \
+    "Running tests now.You've hit your session limit · resets 1pm (America/Montevideo)"; do
+    fm_worker_account_claude_limit_line "$line" >/dev/null || fail "should match a usage-limit line: $line"
+  done
+  [ "$(fm_worker_account_claude_limit_line "● 5-hour limit reached ∙ resets 3pm")" = "5-hour limit reached ∙ resets 3pm" ] ||
+    fail "the matched line should be trimmed of bullets and borders"
+  for line in "Approaching usage limit · resets at 3pm" "> fix the rate limit bug" "limit: 35"; do
+    if fm_worker_account_claude_limit_line "$line" >/dev/null; then
+      fail "should not match: $line"
+    fi
+  done
+  if fm_worker_account_claude_limit_line "You've hit your session limit
+$(seq 1 20)"; then
+    fail "a limit line scrolled above the last 15 non-blank lines is history, not the current state"
+  fi
+  pass "the usage-limit matcher reads several phrasings near the bottom and ignores warnings and history"
+}
+
+test_no_pool_passes_untouched
+test_confirmed_limit_relaunches_on_the_next_account
+test_unlimited_account_dismisses_the_evidence
+test_every_account_limited_declares_one_timed_wait
+test_expired_wait_resumes_and_resolves_the_pause
+test_expired_wait_retries_a_worker_still_stopped
+test_expired_wait_retries_a_worker_limited_again_during_the_wait
+test_expired_wait_leaves_a_resumed_worker_alone
+test_expired_wait_ignores_an_old_limit_line_on_a_resumed_worker
+test_stop_failure_read_mid_hook_keeps_the_stop
+test_turn_started_after_a_stop_failure_is_a_resume
+test_expired_wait_reads_a_new_limit_line_through_the_probe
+test_new_limit_line_after_a_finished_turn_is_a_resume
+test_expired_wait_leaves_a_busy_window_alone
+test_expired_wait_without_busy_record_reads_the_pane
+test_unprobeable_own_account_needs_the_service_verdict
+test_same_email_directories_are_one_account
+test_signed_out_and_unprobeable_accounts_are_skipped
+test_unlisted_account_stops_the_rotation
+test_unconfirmed_probe_surfaces_without_acting
+test_stop_failure_record_is_structural_evidence
+test_default_model_probes_with_the_root_settings_model
+test_status_and_select
+test_validation_scan_reports_a_daemon_limit_once
+test_limit_line_matcher
+
+if [ -f "$TMP_ROOT/task-tmps" ]; then
+  while IFS= read -r d; do
+    [ -n "$d" ] && rm -rf "$d"
+  done < "$TMP_ROOT/task-tmps"
+fi
+echo "# all fm-claude-account-rotation tests passed"
