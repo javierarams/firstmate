@@ -1,0 +1,162 @@
+=== S1 status: real pool with allowlisted emails
+$ /Users/javieraramberri/.no-mistakes/worktrees/f6435520bba9/01M4KKPMCDZEE02ZSQ2V22R5YP/bin/fm-claude-account-rotate.sh status
+pool: 2 entries; selected /Users/javieraramberri/.claude-configs/personal
+* /Users/javieraramberri/.claude-configs/personal  javieraramberri37@gmail.com allowed
+  /Users/javieraramberri/.claude-configs/qualabs  javier@qualabs.com allowed
+[exit 0]
+
+=== S2 live probe of each real account (haiku)
+$ /Users/javieraramberri/.no-mistakes/worktrees/f6435520bba9/01M4KKPMCDZEE02ZSQ2V22R5YP/bin/fm-claude-account-rotate.sh probe /Users/javieraramberri/.claude-configs/personal --model haiku
+allowed 1792026000
+[exit 0]
+$ /Users/javieraramberri/.no-mistakes/worktrees/f6435520bba9/01M4KKPMCDZEE02ZSQ2V22R5YP/bin/fm-claude-account-rotate.sh probe /Users/javieraramberri/.claude-configs/qualabs --model haiku
+allowed 1791716400
+[exit 0]
+
+=== S3 adversarial: pane limit line on a healthy worker (account=personal) -> live probe decides, no relaunch
+$ /Users/javieraramberri/.no-mistakes/worktrees/f6435520bba9/01M4KKPMCDZEE02ZSQ2V22R5YP/bin/fm-claude-account-rotate.sh observe t-healthy --pane-hash h1 --pane-line You've hit your usage limit · resets 3pm
+pass	the recorded account javieraramberri37@gmail.com is not limited
+[exit 0]
+episode:
+gen=gen-1
+outcome=dismissed
+evidence=pane:h1
+until=0
+declared=
+busy=
+pane=
+probed=
+control relaunch called? -> 0
+repeat observe (same evidence):
+$ /Users/javieraramberri/.no-mistakes/worktrees/f6435520bba9/01M4KKPMCDZEE02ZSQ2V22R5YP/bin/fm-claude-account-rotate.sh observe t-healthy --pane-hash h1 --pane-line You've hit your usage limit · resets 3pm
+pass	this limit evidence was already dismissed
+[exit 0]
+
+=== S4 adversarial: pane limit line on a worker with no recorded account -> unconfirmed, nothing relaunched
+$ /Users/javieraramberri/.no-mistakes/worktrees/f6435520bba9/01M4KKPMCDZEE02ZSQ2V22R5YP/bin/fm-claude-account-rotate.sh observe t-noacct --pane-hash h1 --pane-line You've hit your usage limit · resets 3pm
+wake	check: claude usage limit unconfirmed for t-noacct: the pane shows 'You've hit your usage limit · resets 3pm' but its account is not recorded or readable, so no live probe could confirm the limit; nothing was relaunched
+[exit 0]
+gen=gen-1
+outcome=unconfirmed
+evidence=pane:h1
+until=0
+declared=
+busy=
+pane=
+probed=
+
+=== S5 adversarial: worker running on a non-allowlisted account -> stop wake naming it
+$ /Users/javieraramberri/.no-mistakes/worktrees/f6435520bba9/01M4KKPMCDZEE02ZSQ2V22R5YP/bin/fm-claude-account-rotate.sh observe t-intruder --pane-hash h1 --pane-line You've hit your usage limit · resets 3pm
+wake	check: claude account rotation stopped: t-intruder runs on intruder@example.com (/var/folders/n1/7vkblp1d4lj_hc9_t82w28680000gn/T//fm-lab-acct.T5iUQw), which is not in config/claude-account-allowlist; stop its work; nothing was relaunched
+[exit 0]
+
+=== S6 adversarial: pool entry not on allowlist -> whole rotation stops, select refused
+$ /Users/javieraramberri/.no-mistakes/worktrees/f6435520bba9/01M4KKPMCDZEE02ZSQ2V22R5YP/bin/fm-claude-account-rotate.sh status
+pool: 2 entries; selected /Users/javieraramberri/.claude-configs/personal
+* /Users/javieraramberri/.claude-configs/personal  javieraramberri37@gmail.com allowed
+  /Users/javieraramberri/.claude-configs/qualabs  javier@qualabs.com NOT ALLOWED
+unconfirmed: t-intruder
+unconfirmed: t-noacct
+[exit 0]
+$ /Users/javieraramberri/.no-mistakes/worktrees/f6435520bba9/01M4KKPMCDZEE02ZSQ2V22R5YP/bin/fm-claude-account-rotate.sh select /Users/javieraramberri/.claude-configs/qualabs
+error: config/claude-account selects /Users/javieraramberri/.claude-configs/qualabs, which is signed in as javier@qualabs.com, an account config/claude-account-allowlist does not list; Firstmate never launches it - sign that root in to an allowed account, or remove it from config/claude-account
+[exit 1]
+$ /Users/javieraramberri/.no-mistakes/worktrees/f6435520bba9/01M4KKPMCDZEE02ZSQ2V22R5YP/bin/fm-claude-account-rotate.sh observe t-block --pane-hash h1 --pane-line You've hit your usage limit · resets 3pm
+wake	check: claude account rotation stopped: pool entry /Users/javieraramberri/.claude-configs/qualabs is signed in as javier@qualabs.com, which config/claude-account-allowlist does not list; t-block stays stopped on its current account and nothing launches on the pool until config/claude-account and config/claude-account-allowlist agree
+[exit 0]
+$ /Users/javieraramberri/.no-mistakes/worktrees/f6435520bba9/01M4KKPMCDZEE02ZSQ2V22R5YP/bin/fm-claude-account-rotate.sh select /Users/javieraramberri/.claude-configs/qualabs
+selected /Users/javieraramberri/.claude-configs/qualabs
+[exit 0]
+selected: /Users/javieraramberri/.claude-configs/qualabs
+
+=== S7 expired wait, worker already resumed (busy record 4 idle -> 6 idle): nothing relaunched
+$ /Users/javieraramberri/.no-mistakes/worktrees/f6435520bba9/01M4KKPMCDZEE02ZSQ2V22R5YP/bin/fm-claude-account-rotate.sh observe t-resumed --pane-hash h1 --pane-line You've hit your usage limit · resets 3pm
+pass	the worker took a turn since it stopped at the Claude usage limit
+[exit 0]
+episode:
+gen=gen-1
+outcome=dismissed
+evidence=pane:h1
+until=0
+declared=
+busy=
+pane=
+probed=
+status log:
+paused [key=claude-usage-limit]: every Claude pool account is at its usage limit; waiting until X
+resolved [key=claude-usage-limit] [at=1791660605]: the worker took a turn since it stopped at the Claude usage limit; nothing was relaunched
+
+=== S8 r5-1: during wait, new limit hash h2 after a finished turn (busy 4->6 idle) refreshes nothing; expiry leaves worker alone
+$ /Users/javieraramberri/.no-mistakes/worktrees/f6435520bba9/01M4KKPMCDZEE02ZSQ2V22R5YP/bin/fm-claude-account-rotate.sh observe t-r51 --pane-hash h2 --pane-line You've hit your usage limit · resets 3pm
+absorb	waiting for a Claude usage reset until 2026-10-10T20:29Z
+[exit 0]
+episode after in-wait observe:
+gen=gen-1
+outcome=waiting
+evidence=pane:h1
+until=1791664191
+declared=1791664191
+busy=4 idle
+pane=h1
+probed=h2
+$ /Users/javieraramberri/.no-mistakes/worktrees/f6435520bba9/01M4KKPMCDZEE02ZSQ2V22R5YP/bin/fm-claude-account-rotate.sh observe t-r51 --pane-hash h2 --pane-line You've hit your usage limit · resets 3pm
+pass	the worker took a turn since it stopped at the Claude usage limit
+[exit 0]
+gen=gen-1
+outcome=dismissed
+evidence=pane:h2
+until=0
+declared=
+busy=
+pane=
+probed=
+
+=== S9 r5-2: StopFailure during wait, then a new turn's busy event after it -> stored unchanged; expiry is a resume
+api-error: 1791660607	gen-1	rate_limit	You hit your limit
+$ /Users/javieraramberri/.no-mistakes/worktrees/f6435520bba9/01M4KKPMCDZEE02ZSQ2V22R5YP/bin/fm-claude-account-rotate.sh observe t-r52
+absorb	waiting for a Claude usage reset until 2026-10-10T20:29Z
+[exit 0]
+episode (busy should be '7 busy', not '8 idle'):
+gen=gen-1
+outcome=waiting
+evidence=stop-failure:gen-1
+until=1791664191
+declared=1791664191
+busy=7 busy
+pane=
+probed=
+$ /Users/javieraramberri/.no-mistakes/worktrees/f6435520bba9/01M4KKPMCDZEE02ZSQ2V22R5YP/bin/fm-claude-account-rotate.sh observe t-r52 --pane-hash h3
+pass	the worker took a turn since it stopped at the Claude usage limit
+[exit 0]
+gen=gen-1
+outcome=dismissed
+evidence=stop-failure:gen-1
+until=0
+declared=
+busy=
+pane=
+probed=
+
+=== S9b r4-2 counterpart: busy event NOT later than the api-error -> stored as <seq+1> idle
+$ /Users/javieraramberri/.no-mistakes/worktrees/f6435520bba9/01M4KKPMCDZEE02ZSQ2V22R5YP/bin/fm-claude-account-rotate.sh observe t-r42
+absorb	waiting for a Claude usage reset until 2026-10-10T20:29Z
+[exit 0]
+gen=gen-1
+outcome=waiting
+evidence=stop-failure:gen-1
+until=1791664191
+declared=1791664191
+busy=6 idle
+pane=
+probed=
+
+=== rotation log
+2026-10-10T19:30Z	t-healthy: dismissed pane:h1; javieraramberri37@gmail.com answers allowed
+2026-10-10T19:30Z	t-noacct: unconfirmed pane:h1: no readable account to probe
+2026-10-10T19:30Z	t-intruder: runs on intruder@example.com, which is not on the allowlist; nothing relaunched
+2026-10-10T19:30Z	blocked: pool entry /Users/javieraramberri/.claude-configs/qualabs is signed in as javier@qualabs.com, which config/claude-account-allowlist does not list
+2026-10-10T19:30Z	selected /Users/javieraramberri/.claude-configs/qualabs by hand
+2026-10-10T19:30Z	t-resumed: wait ended: the worker took a turn since it stopped at the Claude usage limit; nothing relaunched
+2026-10-10T19:30Z	t-r51: wait ended: the worker took a turn since it stopped at the Claude usage limit; nothing relaunched
+2026-10-10T19:30Z	t-r52: wait ended: the worker took a turn since it stopped at the Claude usage limit; nothing relaunched
+lab removed on exit: /var/folders/n1/7vkblp1d4lj_hc9_t82w28680000gn/T//fm-lab.Ugy4tN
