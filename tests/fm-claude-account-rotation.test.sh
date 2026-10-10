@@ -293,8 +293,8 @@ test_expired_wait_resumes_and_resolves_the_pause() {
   pass "an expired wait retries, resumes the worker when an account frees, and resolves its pause"
 }
 
-busy_record() {  # <seq> <state>
-  printf 'v1 gen=gen-1 seq=%s state=%s source=claude-hook event=hook ts=1\n' "$1" "$2" > "$STATE/$ID.busy-state"
+busy_record() {  # <seq> <state> [ts]
+  printf 'v1 gen=gen-1 seq=%s state=%s source=claude-hook event=hook ts=%s\n' "$1" "$2" "${3:-1}" > "$STATE/$ID.busy-state"
 }
 
 # wait_on_stop_failure: an all-limited pool waits on a StopFailure record while
@@ -398,7 +398,7 @@ test_expired_wait_ignores_an_old_limit_line_on_a_resumed_worker() {
   assert_equals absorb "${out%%$'\t'*}" "a limit line seen again during the wait keeps the wait: $out"
   expire_wait
   out=$(observe_pane h9)
-  assert_wait_ended_untouched "$out" "a limit line its account answers allowed to is no new stop" 3
+  assert_wait_ended_untouched "$out" "a limit line after a turn the worker finished is no new stop"
   pass "an expired wait leaves alone a worker that took a turn, even while an old limit line is on its pane"
 }
 
@@ -417,6 +417,46 @@ test_stop_failure_read_mid_hook_keeps_the_stop() {
   assert_contains "$out" "check: claude account rotated: $ID relaunched on $CASE/a (a@example.com)" \
     "the stop whose idle event landed after the read must be retried at expiry"
   pass "a StopFailure record read before its idle event snapshots the idle stop it is about to record"
+}
+
+test_turn_started_after_a_stop_failure_is_a_resume() {
+  local out
+  new_case turn-after-stop
+  wait_on_stop_failure
+  sed -i.bak 's/^until=.*/until=1900000000/' "$STATE/claude-account-rotation/episode-$ID" && rm -f "$STATE/claude-account-rotation/episode-$ID.bak"
+  busy_record 6 idle
+  printf '{"error":"rate_limit","last_assistant_message":"API Error"}\n' | "$ROTATE" record-stop-failure "$STATE" "$ID" --gen gen-1
+  busy_record 7 busy "$FUTURE"
+  out=$(rotate observe "$ID")
+  assert_equals absorb "${out%%$'\t'*}" "a limit hit during the wait keeps the wait: $out"
+  busy_record 8 idle "$FUTURE"
+  expire_wait
+  out=$(rotate observe "$ID")
+  assert_wait_ended_untouched "$out" "a worker whose new turn began after its latest stop"
+  pass "a busy mark later than the StopFailure record is a new turn, not the stop's pending idle event"
+}
+
+test_new_limit_line_after_a_finished_turn_is_a_resume() {
+  local out
+  new_case line-after-turn
+  busy_record 4 idle
+  printf 'rejected 1900000600\n' > "$CASE/a/probe"
+  printf 'rejected 1900000000\n' > "$CASE/b/probe"
+  out=$(observe_pane h1)
+  assert_equals wake "${out%%$'\t'*}" "the first sight should surface the wait: $out"
+  busy_record 6 idle
+  out=$(observe_pane h2)
+  assert_equals absorb "${out%%$'\t'*}" "a new limit line during the wait keeps the wait: $out"
+  out=$(observe_pane h2)
+  assert_equals absorb "${out%%$'\t'*}" "the same line keeps the wait: $out"
+  printf 'allowed\n' > "$CASE/a/probe"
+  printf 'allowed\n' > "$CASE/b/probe"
+  printf 'a@example.com\t1000\t900\nb@example.com\t1000\t900\n' > "$STATE/claude-account-rotation/limited"
+  expire_wait
+  out=$(observe_pane h2)
+  assert_wait_ended_untouched "$out" "a worker that finished a turn while its account is limited again"
+  assert_contains "$out" "the worker took a turn since it stopped at the Claude usage limit" "the pass should say why"
+  pass "a new limit line after a turn the worker finished cleanly does not refresh the wait"
 }
 
 # wait_on_pane_then_new_line <h2-probe>: an all-limited pool waits on pane h1
@@ -756,7 +796,9 @@ test_expired_wait_retries_a_worker_limited_again_during_the_wait
 test_expired_wait_leaves_a_resumed_worker_alone
 test_expired_wait_ignores_an_old_limit_line_on_a_resumed_worker
 test_stop_failure_read_mid_hook_keeps_the_stop
+test_turn_started_after_a_stop_failure_is_a_resume
 test_expired_wait_reads_a_new_limit_line_through_the_probe
+test_new_limit_line_after_a_finished_turn_is_a_resume
 test_expired_wait_leaves_a_busy_window_alone
 test_expired_wait_without_busy_record_reads_the_pane
 test_unprobeable_own_account_needs_the_service_verdict

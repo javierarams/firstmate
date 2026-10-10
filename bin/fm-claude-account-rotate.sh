@@ -88,12 +88,15 @@
 #                   The wait snapshots the worker's busy record (seq and state,
 #                   bin/fm-busy-lib.sh) and pane hash. During the wait only a
 #                   new stop at the limit refreshes that snapshot: a new
-#                   StopFailure record (a busy mark read before its idle event
-#                   lands is stored as that idle event), or a limit line on a
-#                   pane hash other than the snapshot's that a live probe of
-#                   the worker's own account answers rejected right then. Each
-#                   such hash is probed once; an allowed answer refreshes
-#                   nothing. At expiry a
+#                   StopFailure record (a busy mark no later than the record,
+#                   read before its idle event lands, is stored as that idle
+#                   event), or a limit line on a pane hash other than the
+#                   snapshot's that a live probe of the worker's own account
+#                   answers rejected right then, while its busy record, if
+#                   any, is unchanged since the snapshot. Each such hash is
+#                   probed once; an allowed answer or a moved busy record (a
+#                   turn that ended without a StopFailure is a resume)
+#                   refreshes nothing. At expiry a
 #                   worker the watcher classifies busy, whose busy record says
 #                   busy or moved since the snapshot, or, with no idle busy
 #                   record, whose pane changed, has resumed: the wait ends with
@@ -506,6 +509,12 @@ busy_mark() {  # <task> -> "<seq> <state>" of the task's busy record, or empty
   printf '%s %s\n' "$seq" "$state"
 }
 
+busy_ts() {  # <task> -> the ts of the task's busy record, or 0
+  local ts
+  ts=$(sed -n 's/.* ts=\([0-9][0-9]*\).*/\1/p' "$(fm_busy_record_path "$STATE" "$1")" 2>/dev/null | head -n 1)
+  printf '%s\n' "${ts:-0}"
+}
+
 # worker_resumed <task> <pane-hash> <window-busy>
 # Returns 0, with WHY naming the sign, when anything shows the worker active
 # since the waiting episode's snapshot (EP_BUSY, EP_PANE); returns 1 only when
@@ -594,7 +603,7 @@ relaunch_task() {  # <task> <note> -> CONTROL_OUT
 
 observe() {
   local task=$1 pane_hash=$2 pane_line=$3 window_busy=$4 meta gen evidence detail own own_root own_email model
-  local rec rec_gen rec_error rec_msg until was_waiting=0 confirmed note from mark
+  local rec rec_ts=0 rec_gen rec_error rec_msg until was_waiting=0 confirmed note from mark
   fm_task_id_path_safe "$task" || die "invalid task id '$task'"
   meta="$STATE/$task.meta"
   [ -f "$meta" ] || { emit pass "no task record"; return 0; }
@@ -607,7 +616,7 @@ observe() {
   evidence='' detail=''
   rec="$STATE/$task.api-error"
   if [ -f "$rec" ]; then
-    IFS=$'\t' read -r _ rec_gen rec_error rec_msg < "$rec" || true
+    IFS=$'\t' read -r rec_ts rec_gen rec_error rec_msg < "$rec" || true
     rm -f "$rec"
     if [ "$rec_gen" = "$gen" ] && [ "$rec_error" = rate_limit ]; then
       evidence="stop-failure:$gen"
@@ -626,13 +635,17 @@ observe() {
         case "$evidence" in
         stop-failure:*)
           mark=$(busy_mark "$task")
-          case "$mark" in [0-9]*' busy') mark="$((${mark%% *} + 1)) idle" ;; esac
+          case "$rec_ts" in '' | *[!0-9]*) rec_ts=0 ;; esac
+          case "$mark" in
+          [0-9]*' busy') [ "$(busy_ts "$task")" -gt "$rec_ts" ] || mark="$((${mark%% *} + 1)) idle" ;;
+          esac
           episode_write "$task" "$gen" waiting "$evidence" "$EP_UNTIL" "$EP_DECLARED" "$mark" "$pane_hash" "$EP_PROBED"
           ;;
         pane:*)
           if [ "$pane_hash" != "$EP_PANE" ] && [ "$pane_hash" != "$EP_PROBED" ]; then
-            if own_limited "$meta"; then
-              episode_write "$task" "$gen" waiting "$evidence" "$EP_UNTIL" "$EP_DECLARED" "$(busy_mark "$task")" "$pane_hash" "$pane_hash"
+            mark=$(busy_mark "$task")
+            if { [ -z "$mark" ] || [ "$mark" = "$EP_BUSY" ]; } && own_limited "$meta"; then
+              episode_write "$task" "$gen" waiting "$evidence" "$EP_UNTIL" "$EP_DECLARED" "$mark" "$pane_hash" "$pane_hash"
               log_event "$task: new limit line during the wait confirmed by $OWN_EMAIL"
             else
               episode_write "$task" "$gen" waiting "$EP_EVIDENCE" "$EP_UNTIL" "$EP_DECLARED" "$EP_BUSY" "$EP_PANE" "$pane_hash"
