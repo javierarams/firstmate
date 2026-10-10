@@ -359,6 +359,84 @@ test_raw_claude_account_override_is_kept_without_a_pin() {
   pass "an unpinned home keeps a raw Claude account override"
 }
 
+# account_root <dir> <email>: a signed-in Claude root whose store names <email>.
+account_root() {
+  signed_in_claude_root "$1"
+  printf '{"oauthAccount":{"emailAddress":"%s"}}\n' "$2" > "$1/.claude.json"
+}
+
+test_rotation_pool_launches_the_selected_entry() {
+  local out rc id=acct-pool rot
+  new_case pool claude
+  account_root "$CASE/work" work@example.com
+  account_root "$CASE/personal" me@example.com
+  printf '%s\n%s\n' "$CASE/work" "$CASE/personal" > "$HOME_DIR/config/claude-account"
+  printf 'work@example.com\nme@example.com\n' > "$HOME_DIR/config/claude-account-allowlist"
+  out=$(spawn_ship "$id-first"); rc=$?
+  expect_code 0 "$rc" "a pool with no recorded selection should launch its first entry: $out"
+  assert_contains "$out" "account=$CASE/work" "with no selection the first pool entry should launch"
+  rot="$HOME_DIR/state/claude-account-rotation"
+  mkdir -p "$rot"
+  printf '%s\n' "$CASE/personal" > "$rot/selected"
+  out=$(spawn_ship "$id-selected"); rc=$?
+  expect_code 0 "$rc" "a pool with a recorded selection should launch it: $out"
+  assert_contains "$out" "account=$CASE/personal" "the recorded selection should launch"
+  assert_grep "account=$CASE/personal" "$HOME_DIR/state/$id-selected.meta" "the task record should carry the selected entry"
+  run_pane
+  assert_grep "CLAUDE_CONFIG_DIR=$CASE/personal" "$CASE/claude-worker" "the worker should run under the selected entry"
+  printf '%s\n' "$CASE/removed" > "$rot/selected"
+  out=$(spawn_ship "$id-stale"); rc=$?
+  expect_code 0 "$rc" "a selection the pool no longer lists should fall back: $out"
+  assert_contains "$out" "account=$CASE/work" "a selection outside the pool should fall back to the first entry"
+  pass "a rotation pool launches its recorded selection, else its first entry"
+}
+
+test_allowlist_refuses_unlisted_and_unreadable_accounts() {
+  local out rc id=acct-allow
+  new_case allowlist claude
+  account_root "$CASE/work" work@example.com
+  printf '%s\n' "$CASE/work" > "$HOME_DIR/config/claude-account"
+  printf 'WORK@example.com\n' > "$HOME_DIR/config/claude-account-allowlist"
+  out=$(spawn_ship "$id-listed"); rc=$?
+  expect_code 0 "$rc" "a pinned account the allowlist lists, in any case, should launch: $out"
+  account_root "$CASE/work" other@example.org
+  : > "$CASE/claude-checks"
+  out=$(spawn_ship "$id-unlisted"); rc=$?
+  expect_code 1 "$rc" "an account outside the allowlist must refuse"
+  assert_refused_before_launch "$id-unlisted" "$out" "which is signed in as other@example.org, an account config/claude-account-allowlist does not list"
+  [ ! -s "$CASE/claude-checks" ] || fail "an unlisted account must refuse before its sign-in check runs"
+  printf '{}\n' > "$CASE/work/.claude.json"
+  out=$(spawn_ship "$id-unreadable"); rc=$?
+  expect_code 1 "$rc" "an account whose email cannot be read must refuse"
+  assert_refused_before_launch "$id-unreadable" "$out" "its account email cannot be read from $CASE/work/.claude.json"
+  printf 'not an email\n' > "$HOME_DIR/config/claude-account-allowlist"
+  out=$(spawn_ship "$id-malformed"); rc=$?
+  expect_code 1 "$rc" "a malformed allowlist must refuse"
+  assert_refused_before_launch "$id-malformed" "$out" "config/claude-account-allowlist must hold one account email per line"
+  pass "the allowlist refuses an unlisted, unreadable, or malformed account before any launch"
+}
+
+test_rotation_pool_refusals() {
+  local out rc id=acct-pool-bad
+  new_case pool-refusals claude
+  account_root "$CASE/work" work@example.com
+  account_root "$CASE/personal" me@example.com
+  printf '%s\n%s\n' "$CASE/work" "$CASE/personal" > "$HOME_DIR/config/claude-account"
+  out=$(spawn_ship "$id-noallow"); rc=$?
+  expect_code 1 "$rc" "a pool without an allowlist must refuse"
+  assert_refused_before_launch "$id-noallow" "$out" "requires config/claude-account-allowlist"
+  printf 'work@example.com\n' > "$HOME_DIR/config/claude-account-allowlist"
+  printf '%s\n%s\n%s\n' "$CASE/work" "$CASE/personal" "$CASE/work" > "$HOME_DIR/config/claude-account"
+  out=$(spawn_ship "$id-dup"); rc=$?
+  expect_code 1 "$rc" "a pool listing one entry twice must refuse"
+  assert_refused_before_launch "$id-dup" "$out" "lists the same account entry twice"
+  printf '%s\n\n%s\n' "$CASE/work" "$CASE/personal" > "$HOME_DIR/config/claude-account"
+  out=$(spawn_ship "$id-blank"); rc=$?
+  expect_code 1 "$rc" "a pool with a blank line must refuse"
+  assert_refused_before_launch "$id-blank" "$out" "config/claude-account must hold 'ordinary' or absolute paths, one per line"
+  pass "a rotation pool refuses without an allowlist, with a repeated entry, or with a blank line"
+}
+
 test_local_secondmate_reads_the_launching_home_pin() {
   local out rc id=acct-sm sm
   new_case secondmate claude
@@ -397,5 +475,8 @@ test_raw_claude_command_receives_the_pin
 test_raw_claude_account_override_refuses_under_a_pin
 test_raw_claude_account_override_is_kept_without_a_pin
 test_local_secondmate_reads_the_launching_home_pin
+test_rotation_pool_launches_the_selected_entry
+test_allowlist_refuses_unlisted_and_unreadable_accounts
+test_rotation_pool_refusals
 
 echo "# all fm-worker-account tests passed"

@@ -851,8 +851,9 @@ The [Claude adapter reference](../.agents/skills/harness-adapters/references/har
 
 A home that mixes accounts for one runner, such as a work login and a personal one, can pin the account its own Claude and Pi workers launch on.
 The pin is opt-in: with neither file, every launch is unchanged, and Claude workers keep receiving firstmate's own `CLAUDE_CONFIG_DIR` when it is set.
+A Claude pin can also list several accounts as a rotation pool, which supervision rotates through automatically when a worker hits its usage limit ([Claude account rotation](#claude-account-rotation)).
 
-Both files are local and gitignored.
+Both files are local and gitignored, as is `config/claude-account-allowlist`.
 
 | Runner | File | Variable the launch receives | `ordinary` means |
 | --- | --- | --- | --- |
@@ -862,6 +863,7 @@ Both files are local and gitignored.
 ### File format and provider selection
 
 `config/claude-account` holds one line: `ordinary`, or the absolute path of an existing Claude config directory.
+It may instead list several such entries, one per line and none twice, as a rotation pool.
 `config/pi-account` holds that same root on line 1 and, on line 2, the providers this home may spend, separated by spaces, for example `openai-codex anthropic`.
 
 A final newline is optional; any other line, a relative path, or a control character such as a CR refuses.
@@ -890,12 +892,37 @@ A home that authenticates Claude through environment credentials on purpose shou
 ### Failures, reporting, and inheritance
 
 A malformed file, a root that is not a readable directory, or a signed-out account refuses the launch and names the file to fix; Firstmate never falls back to the ambient account and never changes a global login or copies a credential.
+When `config/claude-account-allowlist` exists, every pinned Claude launch also reads the selected root's account email from its `.claude.json` (`oauthAccount.emailAddress`; `~/.claude.json` for `ordinary`) and refuses an email the allowlist does not list or that cannot be read, before the sign-in check runs.
 The spawn prints the pin as `account=` (plus `account_provider=` for Pi) and records the same fields in the task record, so the session-start digest shows which account each worker launched on.
 
 Pins are not inherited into secondmate homes: a local secondmate agent launches on the launching home's pin, while the secondmate's own workers read the secondmate home's files.
 A remote secondmate is launched on its host from its own home's configuration, so create the file in that remote home.
 
-[`bin/fm-worker-account-lib.sh`](../bin/fm-worker-account-lib.sh) owns parsing, the sign-in check, and the full list of credentials a Claude launch unsets; [runtime backend verification](verification/runtime-backends.md#worker-account-pin-sign-in-check) records the check against the real runners.
+[`bin/fm-worker-account-lib.sh`](../bin/fm-worker-account-lib.sh) owns parsing, the allowlist and sign-in checks, and the full list of credentials a Claude launch unsets; [runtime backend verification](verification/runtime-backends.md#worker-account-pin-sign-in-check) records the check against the real runners.
+
+### Claude account rotation
+
+A `config/claude-account` that lists two or more entries is a rotation pool, and it requires `config/claude-account-allowlist`: one account email per line, matched without regard to case, with no blank lines.
+Every Claude launch from the home - ships, scouts, local secondmate agents, and relaunches - uses the pool's current selection, which is the first entry until the rotation records another.
+Directories signed in to the same email are one account for rotation, because they share one usage limit.
+
+When a Claude ship or scout stops at its usage limit, the watcher notices either from Claude's own API-error record for that worker or from a usage-limit line on its idle pane, and the rotation then acts without waiting for a conversational turn:
+
+- It first checks the whole pool: an entry whose account email is missing or not on the allowlist stops all rotation for the home and is reported once as a blocker, and nothing launches on the pool until `config/claude-account` and the allowlist agree again.
+- It confirms the limit with a minimal live turn on the worker's own recorded account and model; an account that still answers is not limited, so nothing moves and ordinary supervision continues.
+  A worker recorded on an account the allowlist does not list is reported once by email and never relaunched, and a worker with no recorded, readable account is relaunched only on Claude's own API-error record, never on a pane line alone.
+- It walks the pool from the current selection, skipping accounts known to be limited, and takes the first that passes the sign-in check and a live turn of its own.
+  It records that account as the selection, so new spawns use it too, and relaunches the worker on it with its local copy, instructions, model, and effort preserved and its account recorded in the task record.
+- When no account is usable it keeps the worker where it is, declares a wait in the worker's status log until the earliest known reset, and retries then if the worker has not taken a turn since its latest stop at the limit, by its busy record, or its idle pane still shows the limit; a worker that took a turn meanwhile without stopping at the limit again is left alone and the wait is resolved.
+
+Each episode surfaces as one supervision notification: the rotation, the wait, a blocker, or a relaunch that could not complete.
+A secondmate agent is never rotated; it takes the current selection at its next launch.
+
+The rotation never touches the shared no-mistakes daemon.
+When one of the home's validation runs fails because the daemon's Claude agent hit its usage limit, supervision reports the run once with the daemon's account, read from the daemon process itself, and the next usable pool account, so firstmate can decide whether to switch the daemon.
+
+`bin/fm-claude-account-rotate.sh status` shows the pool, the selection, and any limit, wait, or block, and `select <entry>` records a selection by hand.
+That script's header owns the probe, the evidence, the episode records under `state/claude-account-rotation/`, and the retry timing; [runtime backend verification](verification/runtime-backends.md#claude-account-rotation-probe-and-stopfailure-record) records its probe and API-error record against the real runner.
 
 ## Lavish server address (config/lavish-axi-host)
 
