@@ -293,25 +293,56 @@ test_expired_wait_resumes_and_resolves_the_pause() {
   pass "an expired wait retries, resumes the worker when an account frees, and resolves its pause"
 }
 
-test_expired_wait_leaves_a_resumed_worker_alone() {
+busy_record() {  # <seq> <state>
+  printf 'v1 gen=gen-1 seq=%s state=%s source=claude-hook event=hook ts=1\n' "$1" "$2" > "$STATE/$ID.busy-state"
+}
+
+# wait_on_stop_failure: an all-limited pool waits on a StopFailure record while
+# the worker's busy record says idle at seq 4, then the wait expires with both
+# accounts free again.
+wait_on_stop_failure() {
   local out
-  new_case resumed
+  busy_record 4 idle
   printf 'rejected 1900000600\n' > "$CASE/a/probe"
   printf 'rejected 1900000000\n' > "$CASE/b/probe"
-  out=$(observe_pane)
+  printf '{"error":"rate_limit","last_assistant_message":"API Error"}\n' | "$ROTATE" record-stop-failure "$STATE" "$ID" --gen gen-1
+  out=$(rotate observe "$ID")
   assert_equals wake "${out%%$'\t'*}" "the first sight should surface the wait: $out"
   printf 'allowed\n' > "$CASE/a/probe"
   printf 'allowed\n' > "$CASE/b/probe"
+  printf 'a@example.com\t1000\t900\nb@example.com\t1000\t900\n' > "$STATE/claude-account-rotation/limited"
   sed -i.bak 's/^until=.*/until=1000/' "$STATE/claude-account-rotation/episode-$ID" && rm -f "$STATE/claude-account-rotation/episode-$ID.bak"
+}
+
+test_expired_wait_retries_a_worker_still_stopped() {
+  local out
+  new_case still-stopped
+  wait_on_stop_failure
   out=$(rotate observe "$ID")
-  assert_equals pass "${out%%$'\t'*}" "an expired wait without fresh limit evidence must not act: $out"
-  assert_not_relaunched "a worker that resumed during its wait"
-  assert_equals 2 "$(probe_count)" "a resumed worker must not be probed again"
+  assert_equals wake "${out%%$'\t'*}" "a worker idle at the same busy seq must be retried without a pane line: $out"
+  assert_contains "$out" "check: claude account rotated: $ID relaunched on $CASE/a (a@example.com)" \
+    "the retry should resume the worker on the first usable account"
   assert_contains "$(tail -n 1 "$STATE/$ID.status")" "resolved [key=claude-usage-limit] [at=" \
-    "ending the wait should resolve the declared pause"
-  out=$(rotate observe "$ID")
-  assert_equals pass "${out%%$'\t'*}" "the ended wait must stay quiet: $out"
-  pass "an expired wait whose worker no longer shows the limit ends without relaunching it"
+    "resuming should resolve the declared pause"
+  pass "an expired wait retries a worker whose busy record shows no turn since, with no pane line"
+}
+
+test_expired_wait_leaves_a_resumed_worker_alone() {
+  local out state
+  for state in "5 idle" "4 busy"; do
+    new_case "resumed-${state% *}"
+    wait_on_stop_failure
+    busy_record "${state% *}" "${state#* }"
+    out=$(rotate observe "$ID")
+    assert_equals pass "${out%%$'\t'*}" "a worker whose busy record moved to $state must not be retried: $out"
+    assert_not_relaunched "a worker that took a turn during its wait"
+    assert_equals 2 "$(probe_count)" "a resumed worker must not be probed again"
+    assert_contains "$(tail -n 1 "$STATE/$ID.status")" "resolved [key=claude-usage-limit] [at=" \
+      "ending the wait should resolve the declared pause"
+    out=$(rotate observe "$ID")
+    assert_equals pass "${out%%$'\t'*}" "the ended wait must stay quiet: $out"
+  done
+  pass "an expired wait whose worker took a turn since ends without relaunching it"
 }
 
 test_unprobeable_own_account_needs_the_service_verdict() {
@@ -339,7 +370,7 @@ test_unprobeable_own_account_needs_the_service_verdict() {
   sed -i.bak "s|^account=.*|account=$CASE/x|" "$STATE/$ID.meta" && rm -f "$STATE/$ID.meta.bak"
   out=$(observe_pane)
   assert_equals wake "${out%%$'\t'*}" "a worker on a disallowed account must surface: $out"
-  assert_contains "$out" "check: claude account not allowed: $ID runs on intruder@example.org" "the wake should name the disallowed email"
+  assert_contains "$out" "check: claude account rotation stopped: $ID runs on intruder@example.org" "the wake should name the disallowed email"
   assert_equals "$CASE/x" "$(meta_field account)" "the task record must keep its account"
   assert_no_grep "Firstmate operational input waiting" "$CASE/fake/literal" "a disallowed account's worker must not be relaunched"
   assert_equals 0 "$(probe_count)" "a disallowed account must never be probed"
@@ -562,6 +593,7 @@ test_confirmed_limit_relaunches_on_the_next_account
 test_unlimited_account_dismisses_the_evidence
 test_every_account_limited_declares_one_timed_wait
 test_expired_wait_resumes_and_resolves_the_pause
+test_expired_wait_retries_a_worker_still_stopped
 test_expired_wait_leaves_a_resumed_worker_alone
 test_unprobeable_own_account_needs_the_service_verdict
 test_same_email_directories_are_one_account

@@ -81,10 +81,13 @@
 #                   `paused [key=claude-usage-limit]: ... until <UTC>` line,
 #                   renewed only when the time changes - until the earliest
 #                   known reset (FM_CLAUDE_ROTATE_UNKNOWN_RESET_SECS after the
-#                   observation when an account reported none), then retries
-#                   only while the worker still shows fresh limit evidence;
-#                   without it the wait ends with nothing relaunched. Either
-#                   end appends the matching `resolved` line.
+#                   observation when an account reported none), then retries.
+#                   The wait records the task's busy record (seq and state,
+#                   bin/fm-busy-lib.sh); the retry needs a fresh pane limit
+#                   line or that record still idle at the same seq, and a
+#                   worker that took a turn meanwhile ends the wait with
+#                   nothing relaunched. Either end appends the matching
+#                   `resolved` line.
 #                A failed relaunch or an unconfirmed limit surfaces once and
 #                then passes the window back to ordinary stale triage for the
 #                rest of that incarnation; a block is retried every
@@ -168,6 +171,8 @@ CONFIG="${FM_CONFIG_OVERRIDE:-$FM_HOME/config}"
 . "$SCRIPT_DIR/fm-wake-lib.sh"
 # shellcheck source=bin/fm-worker-account-lib.sh
 . "$SCRIPT_DIR/fm-worker-account-lib.sh"
+# shellcheck source=bin/fm-busy-lib.sh
+. "$SCRIPT_DIR/fm-busy-lib.sh"
 
 PROBE_SECONDS=${FM_CLAUDE_ROTATE_PROBE_SECONDS:-60}
 UNKNOWN_RESET_SECS=${FM_CLAUDE_ROTATE_UNKNOWN_RESET_SECS:-1800}
@@ -446,10 +451,10 @@ block_clear() {
 
 # --- episodes -----------------------------------------------------------------
 
-EP_GEN='' EP_OUTCOME='' EP_EVIDENCE='' EP_UNTIL='' EP_DECLARED=''
+EP_GEN='' EP_OUTCOME='' EP_EVIDENCE='' EP_UNTIL='' EP_DECLARED='' EP_BUSY=''
 episode_read() {  # <task>
   local line
-  EP_GEN='' EP_OUTCOME='' EP_EVIDENCE='' EP_UNTIL='' EP_DECLARED=''
+  EP_GEN='' EP_OUTCOME='' EP_EVIDENCE='' EP_UNTIL='' EP_DECLARED='' EP_BUSY=''
   [ -f "$R/episode-$1" ] || return 1
   while IFS= read -r line || [ -n "$line" ]; do
     case "$line" in
@@ -458,19 +463,28 @@ episode_read() {  # <task>
     evidence=*) EP_EVIDENCE=${line#evidence=} ;;
     until=*) EP_UNTIL=${line#until=} ;;
     declared=*) EP_DECLARED=${line#declared=} ;;
+    busy=*) EP_BUSY=${line#busy=} ;;
     esac
   done < "$R/episode-$1"
   case "$EP_UNTIL" in '' | *[!0-9]*) EP_UNTIL=0 ;; esac
   return 0
 }
 
-episode_write() {  # <task> <gen> <outcome> <evidence> <until> [declared]
+episode_write() {  # <task> <gen> <outcome> <evidence> <until> [declared] [busy]
   write_file "$R/episode-$1" "gen=$2
 outcome=$3
 evidence=$4
 until=$5
 declared=${6:-}
+busy=${7:-}
 "
+}
+
+busy_mark() {  # <task> -> "<seq> <state>" of the task's busy record, or empty
+  local rec state seq
+  rec=$(fm_busy_record_read "$STATE" "$1") || return 0
+  read -r state _ _ seq <<< "$rec"
+  printf '%s %s\n' "$seq" "$state"
 }
 
 task_gen() {  # <task> <meta>
@@ -556,14 +570,21 @@ observe() {
   else
     EP_DECLARED=
   fi
-  if [ -z "$evidence" ]; then
-    if [ "$was_waiting" = 1 ]; then
+  if [ -z "$evidence" ] && [ "$was_waiting" = 1 ]; then
+    case "$EP_BUSY" in
+    *' idle')
+      [ "$(busy_mark "$task")" != "$EP_BUSY" ] || evidence=$EP_EVIDENCE
+      ;;
+    esac
+    if [ -z "$evidence" ]; then
       episode_write "$task" "$gen" dismissed "$EP_EVIDENCE" 0
-      [ -z "$EP_DECLARED" ] || status_append "$task" "resolved [key=$WAIT_KEY]: the worker no longer shows the Claude usage limit; nothing was relaunched"
-      log_event "$task: wait ended without fresh limit evidence; nothing relaunched"
-      emit pass "the worker no longer shows the usage limit"
+      [ -z "$EP_DECLARED" ] || status_append "$task" "resolved [key=$WAIT_KEY]: the worker took a turn while it waited on the Claude usage limit; nothing was relaunched"
+      log_event "$task: wait ended; the worker's busy record moved past $EP_BUSY; nothing relaunched"
+      emit pass "the worker took a turn while it waited on the usage limit"
       return 0
     fi
+  fi
+  if [ -z "$evidence" ]; then
     emit pass "no usage-limit evidence for the current agent"
     return 0
   fi
@@ -589,7 +610,7 @@ observe() {
   if [ -n "$own_email" ] && ! printf '%s\n' "$ALLOWED" | grep -Fxq -- "$own_email"; then
     episode_write "$task" "$gen" unconfirmed "$evidence" 0 "$EP_DECLARED"
     log_event "$task: runs on $own_email, which is not on the allowlist; nothing relaunched"
-    emit wake "check: claude account not allowed: $task runs on $own_email ($own), which is not in config/claude-account-allowlist; stop its work; nothing was relaunched"
+    emit wake "check: claude account rotation stopped: $task runs on $own_email ($own), which is not in config/claude-account-allowlist; stop its work; nothing was relaunched"
     return 0
   fi
   confirmed=$was_waiting
@@ -649,7 +670,7 @@ observe() {
   if [ "$EP_DECLARED" != "$until" ]; then
     status_append "$task" "paused [key=$WAIT_KEY]: every Claude pool account is at its usage limit; waiting on $from until $(iso_of "$until")"
   fi
-  episode_write "$task" "$gen" waiting "$evidence" "$until" "$until"
+  episode_write "$task" "$gen" waiting "$evidence" "$until" "$until" "$(busy_mark "$task")"
   log_event "$task: waiting until $(iso_of "$until")${NOTES:+ ($NOTES)}"
   if [ "$was_waiting" = 1 ]; then
     emit absorb "still waiting for a Claude usage reset until $(iso_of "$until")"

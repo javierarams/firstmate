@@ -913,7 +913,7 @@ When a Claude ship or scout stops at its usage limit, the watcher notices either
   A worker recorded on an account the allowlist does not list is reported once by email and never relaunched, and a worker with no recorded, readable account is relaunched only on Claude's own API-error record, never on a pane line alone.
 - It walks the pool from the current selection, skipping accounts known to be limited, and takes the first that passes the sign-in check and a live turn of its own.
   It records that account as the selection, so new spawns use it too, and relaunches the worker on it with its local copy, instructions, model, and effort preserved and its account recorded in the task record.
-- When no account is usable it keeps the worker where it is, declares a wait in the worker's status log until the earliest known reset, and retries then if the worker's idle pane still shows the limit; a worker that resumed meanwhile is left alone and the wait is resolved.
+- When no account is usable it keeps the worker where it is, declares a wait in the worker's status log until the earliest known reset, and retries then if the worker has not taken a turn since, by its busy record, or its idle pane still shows the limit; a worker that took a turn meanwhile is left alone and the wait is resolved.
 
 Each episode surfaces as one supervision notification: the rotation, the wait, a blocker, or a relaunch that could not complete.
 A secondmate agent is never rotated; it takes the current selection at its next launch.
