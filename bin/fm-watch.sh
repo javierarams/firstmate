@@ -142,6 +142,18 @@
 #                          the same verdict authorized recovery but the
 #                          relaunch itself failed; the attempt is ledgered and
 #                          counts toward the bound below
+#   check: claude account rotated: <id> ... | check: claude usage limit: <id> ...
+#   check: claude account rotation stopped|failed ... | check: claude usage limit unconfirmed ...
+#                          a Claude ship or scout stopped at its usage limit while
+#                          config/claude-account lists a rotation pool, and
+#                          bin/fm-claude-account-rotate.sh relaunched it on the
+#                          next usable account, declared a timed wait, or could
+#                          not act; one wake per episode (claude_limit_check).
+#                          This is the stale path's only automatic relaunch.
+#   check: no-mistakes validation <run> for <id> failed when its Claude agent hit ...
+#                          the shared daemon's agent hit its usage limit; names the
+#                          daemon's account and the next usable pool account and
+#                          touches nothing (claude_validation_tick)
 #   check: secondmate <id> auto-relaunch paused after <n> attempts in <s>s; ...
 #                          a mate that kept dying exceeded its bounded relaunch
 #                          budget and is parked until a probe reads it live
@@ -234,6 +246,11 @@ WATCH_HOME_EXISTED=0
 # and wake emission (secondmate_liveness_tick below).
 # shellcheck source=/dev/null # Analyzed separately as a canonical lint root.
 . "$SCRIPT_DIR/fm-secondmate-liveness-lib.sh"
+# Claude account rotation: the worker account pin's owner supplies the
+# rotation-pool test and the usage-limit line matcher; the rotation itself is
+# bin/fm-claude-account-rotate.sh (claude_limit_check below).
+# shellcheck source=bin/fm-worker-account-lib.sh
+. "$SCRIPT_DIR/fm-worker-account-lib.sh"
 
 WATCH_LOCK="$STATE/.watch.lock"
 WATCH_PATH="$SCRIPT_DIR/fm-watch.sh"
@@ -367,6 +384,13 @@ SECONDMATE_LIVENESS_MAX_ATTEMPTS=${FM_SECONDMATE_LIVENESS_MAX_ATTEMPTS:-}
 case "$SECONDMATE_LIVENESS_MAX_ATTEMPTS" in ''|*[!0-9]*|0) SECONDMATE_LIVENESS_MAX_ATTEMPTS=3 ;; esac
 SECONDMATE_LIVENESS_WINDOW_SECS=${FM_SECONDMATE_LIVENESS_WINDOW_SECS:-}
 case "$SECONDMATE_LIVENESS_WINDOW_SECS" in ''|*[!0-9]*|0) SECONDMATE_LIVENESS_WINDOW_SECS=3600 ;; esac
+# Claude account rotation, active only while config/claude-account lists a
+# rotation pool: the rotation owner, and the cadence of its scan for no-mistakes
+# runs that failed at the daemon agent's usage limit.
+CLAUDE_ROTATE_BIN=${FM_CLAUDE_ROTATE_BIN:-$SCRIPT_DIR/fm-claude-account-rotate.sh}
+CLAUDE_ROTATE_VALIDATION_SECS=${FM_CLAUDE_ROTATE_VALIDATION_SECS:-}
+case "$CLAUDE_ROTATE_VALIDATION_SECS" in ''|*[!0-9]*|0) CLAUDE_ROTATE_VALIDATION_SECS=120 ;; esac
+CLAUDE_ROTATION_ON=0
 # A crew that declared a pause is idling on a known external wait, so its stale
 # pane is absorbed rather than wedge-escalated.
 # A captain-held or paused crew whose agent has confidently exited uses the same
@@ -1131,6 +1155,95 @@ secondmate_liveness_tick() {
   done
   [ -z "$first_reason" ] || wake "$first_reason"
   [ "$failed" -eq 0 ]
+}
+
+# Claude usage-limit rotation, active only while config/claude-account lists a
+# rotation pool (CLAUDE_ROTATION_ON, refreshed every cycle). For a Claude ship or
+# scout window the evidence is the agent's StopFailure record
+# (state/<id>.api-error, written by the hook bin/fm-spawn.sh wires) or a pane
+# that kept the same hash across two polls and shows a usage-limit line
+# (fm_worker_account_claude_limit_line). `fm-claude-account-rotate.sh observe`
+# owns everything after that: confirming the limit with a live probe, relaunching
+# on the next usable pool account, declaring a timed wait when none is usable,
+# and deciding which outcome wakes, at most once per episode. This automatic
+# relaunch is the one deliberate exception to the stale path's never-restart
+# rule: the service itself confirms the limit before anything moves, and a
+# relaunch keeps the worktree, its commits, and the brief. While observe absorbs
+# a window (a declared wait, a standing block) the window is re-observed every
+# poll so the retry fires on time; a stable pane already read without a limit
+# line, or passed by the rotation, is remembered per window by its hash so it
+# is neither re-read nor re-probed every poll.
+# Returns 0 when this poll handled the window (skip ordinary stale triage) and
+# 1 otherwise; a wake exits the cycle.
+claude_limit_check() {  # <window> <task> <tail40> <hash> <prev-hash>
+  local w=$1 task=$2 tail=$3 h=$4 prev=$5 meta key absorb pass line='' out verdict note
+  [ "$CLAUDE_ROTATION_ON" = 1 ] && [ -n "$task" ] || return 1
+  meta="$STATE/$task.meta"
+  case "$(fm_meta_get "$meta" kind)" in ship|scout) ;; *) return 1 ;; esac
+  [ "$(fm_meta_get "$meta" harness)" = claude ] || return 1
+  key=$(window_key "$w")
+  absorb="$STATE/.claude-limit-absorb-$key"
+  pass="$STATE/.claude-limit-pass-$key"
+  if [ "$h" = "$prev" ] && [ "$(cat "$pass" 2>/dev/null || true)" != "$h" ]; then
+    line=$(fm_worker_account_claude_limit_line "$tail") || {
+      line=
+      printf '%s' "$h" > "$pass"
+    }
+  fi
+  [ -e "$absorb" ] || [ -n "$line" ] || [ -e "$STATE/$task.api-error" ] || return 1
+  if [ -n "$line" ]; then
+    out=$(FM_HOME="$FM_HOME" FM_STATE_OVERRIDE="$STATE" FM_CONFIG_OVERRIDE="$CONFIG" \
+      "$CLAUDE_ROTATE_BIN" observe "$task" --pane-hash "$h" --pane-line "$line" 2>>"$TRIAGE_LOG") || out=
+  else
+    out=$(FM_HOME="$FM_HOME" FM_STATE_OVERRIDE="$STATE" FM_CONFIG_OVERRIDE="$CONFIG" \
+      "$CLAUDE_ROTATE_BIN" observe "$task" 2>>"$TRIAGE_LOG") || out=
+  fi
+  verdict=${out%%$'\t'*}
+  note=${out#*$'\t'}
+  case "$verdict" in
+    absorb)
+      : > "$absorb"
+      triage_log "absorbed claude usage limit for $task: $note"
+      return 0
+      ;;
+    wake)
+      rm -f "$absorb"
+      fm_wake_append check "claude-account-$task-$(date +%s)" "$note" || exit 1
+      wake "$note"
+      ;;
+    pass)
+      rm -f "$absorb"
+      [ -z "$line" ] || printf '%s' "$h" > "$pass"
+      triage_log "claude usage limit not acted on for $task: $note"
+      ;;
+    *)
+      triage_log "claude account rotation gave no verdict for $task: ${out:-empty}"
+      ;;
+  esac
+  return 1
+}
+
+# On its own cadence, while this home rotates Claude accounts, report each
+# no-mistakes run on this home's branches that failed when the shared daemon's
+# Claude agent hit its usage limit (fm-claude-account-rotate.sh validation-scan
+# owns detection, the once-per-run receipt, and the report). The daemon is
+# shared, so nothing here touches it: the wake hands firstmate its account and
+# the next usable pool account.
+claude_validation_tick() {
+  local tick="$STATE/.claude-validation-scan-tick" out line reason first=''
+  [ "$(age_of "$tick")" -ge "$CLAUDE_ROTATE_VALIDATION_SECS" ] || return 0
+  touch "$tick" || return 0
+  out=$(FM_HOME="$FM_HOME" FM_STATE_OVERRIDE="$STATE" FM_CONFIG_OVERRIDE="$CONFIG" \
+    "$CLAUDE_ROTATE_BIN" validation-scan 2>>"$TRIAGE_LOG") || true
+  while IFS= read -r line; do
+    case "$line" in wake$'\t'*) ;; *) continue ;; esac
+    reason=${line#*$'\t'}
+    fm_wake_append check "claude-validation-$(date +%s)-$RANDOM" "$reason" || exit 1
+    [ -n "$first" ] || first=$reason
+  done <<EOF
+$out
+EOF
+  [ -z "$first" ] || wake "$first"
 }
 
 # Consecutive wedge-escalation count for a window past FM_WEDGE_DEMAND_INSPECT_COUNT
@@ -2702,6 +2815,15 @@ while :; do
     exit 1
   }
 
+  # Claude account rotation is armed only while config/claude-account lists a
+  # rotation pool; the stale scan below consults it per window.
+  if [ "$(fm_worker_account_claude_pool_size "$CONFIG")" -ge 2 ]; then
+    CLAUDE_ROTATION_ON=1
+    claude_validation_tick
+  else
+    CLAUDE_ROTATION_ON=0
+  fi
+
   # Process-to-event liveness repair. This never discovers a result by polling:
   # each registered source has its own child blocking on that source, and this
   # only republishes results already captured durably and restarts a source
@@ -3025,6 +3147,10 @@ EOF
     ewf="$STATE/.wedge-escalations-$key"
     pf="$STATE/.paused-$key"   # flag: this key's stale is using the bounded pause cadence
     prev=$(cat "$hf" 2>/dev/null || true)
+    if claude_limit_check "$w" "$task" "$tail40" "$h" "$prev"; then
+      printf '%s' "$h" > "$hf"
+      continue
+    fi
     # Busy match: a backend's native semantic state when available (herdr), else
     # the last 6 non-blank lines only (the TUI footer area, where every verified
     # harness renders its busy indicator) so busy-looking strings in displayed
