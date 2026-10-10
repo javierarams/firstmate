@@ -327,6 +327,25 @@ test_expired_wait_retries_a_worker_still_stopped() {
   pass "an expired wait retries a worker whose busy record shows no turn since, with no pane line"
 }
 
+test_expired_wait_retries_a_worker_limited_again_during_the_wait() {
+  local out
+  new_case limited-again
+  wait_on_stop_failure
+  sed -i.bak 's/^until=.*/until=1900000000/' "$STATE/claude-account-rotation/episode-$ID" && rm -f "$STATE/claude-account-rotation/episode-$ID.bak"
+  busy_record 5 busy
+  busy_record 6 idle
+  printf '{"error":"rate_limit","last_assistant_message":"API Error"}\n' | "$ROTATE" record-stop-failure "$STATE" "$ID" --gen gen-1
+  out=$(rotate observe "$ID")
+  assert_equals absorb "${out%%$'\t'*}" "a new limit hit during the wait keeps the wait: $out"
+  assert_not_relaunched "a limit hit again before the wait expires"
+  sed -i.bak 's/^until=.*/until=1000/' "$STATE/claude-account-rotation/episode-$ID" && rm -f "$STATE/claude-account-rotation/episode-$ID.bak"
+  out=$(rotate observe "$ID")
+  assert_equals wake "${out%%$'\t'*}" "a worker stopped again at the limit must be retried at expiry: $out"
+  assert_contains "$out" "check: claude account rotated: $ID relaunched on $CASE/a (a@example.com)" \
+    "the retry should resume the worker on the first usable account"
+  pass "a worker that hits the limit again during its wait is retried against its latest stop"
+}
+
 test_expired_wait_leaves_a_resumed_worker_alone() {
   local out state
   for state in "5 idle" "4 busy"; do
@@ -594,6 +613,7 @@ test_unlimited_account_dismisses_the_evidence
 test_every_account_limited_declares_one_timed_wait
 test_expired_wait_resumes_and_resolves_the_pause
 test_expired_wait_retries_a_worker_still_stopped
+test_expired_wait_retries_a_worker_limited_again_during_the_wait
 test_expired_wait_leaves_a_resumed_worker_alone
 test_unprobeable_own_account_needs_the_service_verdict
 test_same_email_directories_are_one_account

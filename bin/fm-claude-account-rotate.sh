@@ -83,7 +83,9 @@
 #                   known reset (FM_CLAUDE_ROTATE_UNKNOWN_RESET_SECS after the
 #                   observation when an account reported none), then retries.
 #                   The wait records the task's busy record (seq and state,
-#                   bin/fm-busy-lib.sh); the retry needs a fresh pane limit
+#                   bin/fm-busy-lib.sh), refreshed with the evidence whenever
+#                   the worker stops at the limit again during the wait; the
+#                   retry needs a fresh pane limit
 #                   line or that record still idle at the same seq, and a
 #                   worker that took a turn meanwhile ends the wait with
 #                   nothing relaunched. Either end appends the matching
@@ -516,7 +518,7 @@ relaunch_task() {  # <task> <note> -> CONTROL_OUT
 
 observe() {
   local task=$1 pane_hash=$2 pane_line=$3 meta gen evidence detail own own_root own_email model
-  local rec rec_gen rec_error rec_msg until was_waiting=0 confirmed note from
+  local rec rec_gen rec_error rec_msg until was_waiting=0 confirmed note from why
   fm_task_id_path_safe "$task" || die "invalid task id '$task'"
   meta="$STATE/$task.meta"
   [ -f "$meta" ] || { emit pass "no task record"; return 0; }
@@ -545,6 +547,7 @@ observe() {
     case "$EP_OUTCOME" in
     waiting)
       if [ "$NOW" -lt "$EP_UNTIL" ]; then
+        [ -z "$evidence" ] || episode_write "$task" "$gen" waiting "$evidence" "$EP_UNTIL" "$EP_DECLARED" "$(busy_mark "$task")"
         emit absorb "waiting for a Claude usage reset until $(iso_of "$EP_UNTIL")"
         return 0
       fi
@@ -577,10 +580,14 @@ observe() {
       ;;
     esac
     if [ -z "$evidence" ]; then
+      case "$EP_BUSY" in
+      *' idle') why="the worker took a turn while it waited on the Claude usage limit" ;;
+      *) why="no busy record shows the worker still stopped at the Claude usage limit" ;;
+      esac
       episode_write "$task" "$gen" dismissed "$EP_EVIDENCE" 0
-      [ -z "$EP_DECLARED" ] || status_append "$task" "resolved [key=$WAIT_KEY]: the worker took a turn while it waited on the Claude usage limit; nothing was relaunched"
-      log_event "$task: wait ended; the worker's busy record moved past $EP_BUSY; nothing relaunched"
-      emit pass "the worker took a turn while it waited on the usage limit"
+      [ -z "$EP_DECLARED" ] || status_append "$task" "resolved [key=$WAIT_KEY]: $why; nothing was relaunched"
+      log_event "$task: wait ended: $why; nothing relaunched"
+      emit pass "$why"
       return 0
     fi
   fi
