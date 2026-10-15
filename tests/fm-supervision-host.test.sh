@@ -1536,6 +1536,62 @@ test_next_park_takes_over_the_cycle_a_pass_through_left_for_main() {
   pass "host+hook: the next park takes over the cycle a main-only pass-through left, so one arm owns it"
 }
 
+# The live loop (2026-10-12, 2026-10-14): the left watcher was inside a slow
+# command substitution when the next park's take-over sent TERM, and bash holds
+# the signal until that command returns. The take-over gave up after a short
+# bound, attached to the dying watcher, and its close reopened main's
+# acknowledged episode as downtime, so every handling turn ended in a
+# "check: rearm-resurface" that main had to handle again. Here the left watcher
+# blocks in its backend capture until well after the take-over starts.
+test_take_over_of_a_slow_to_stop_watcher_keeps_the_handled_episode() {
+  local home left_watcher left_arm took_over stopped
+  home=$(make_primary_home hook-takeover-slow-stop)
+  cat > "$home/fakebin/tmux" <<SH
+#!/usr/bin/env bash
+if [ -e "$home/slow-backend" ]; then
+  : > "$home/backend-blocked"
+  sleep 20
+fi
+exit 1
+SH
+  chmod +x "$home/fakebin/tmux"
+  start_hook_session "$home"
+  turn_end "$home"
+  wait_until 150 watcher_live "$home" || fail "slow stop: the Stop hook never started a watcher cycle: $(cat "$home/hook.err" 2>/dev/null)"
+  append_status "$home" 'which export format?' needs-decision
+  wait_until 250 hook_exited "$home" || fail "slow stop: the decision close never reached the Stop hook: $(cat "$home/state/.supervision-host.log")"
+  assert_re '	pass-through	attended	main-only	signal:' "$home/state/.supervision-host.log" "fixture: the close was not a main-only pass-through"
+  assert_rewoke_main "$home" "slow stop (pass-through)"
+  left_watcher=$(cat "$home/state/.watch.lock/pid")
+  left_arm=$(parent_of "$left_watcher")
+  main_drain "$home" >/dev/null
+  [ -n "$MAIN_ACK" ] || fail "slow stop: main's drain printed no acknowledgement"
+  # shellcheck disable=SC2086 # the printed acknowledgement arguments
+  FM_HOME="$home" "$FAKE_CLAUDE" -c '"$0" "$@" >/dev/null 2>&1' "$ROOT/bin/fm-wake-drain.sh" $MAIN_ACK \
+    || fail "slow stop: main's acknowledgement failed: $MAIN_ACK"
+  assert_re '^acked:' "$home/state/.watcher-down" "fixture: main's acknowledgement did not retire the episode"
+  : > "$home/slow-backend"
+  wait_until 100 test -e "$home/backend-blocked" || fail "fixture: the left watcher never reached its slow backend capture"
+  turn_end "$home"
+  wait_until 150 grep -q "	take-over	arm=$left_arm\$" "$home/state/.supervision-host.log" \
+    || fail "slow stop: the next park did not take over $left_arm: $(cat "$home/state/.supervision-host.log")"
+  took_over=$(date +%s)
+  rm -f "$home/slow-backend"
+  wait_until 350 sh -c '! kill -0 "$1" 2>/dev/null' _ "$left_watcher" || fail "slow stop: the left watcher never stopped"
+  stopped=$(date +%s)
+  [ $((stopped - took_over)) -ge 8 ] \
+    || fail "fixture: the left watcher stopped $((stopped - took_over))s after the take-over, too soon to outlast the old stop bound"
+  wait_until 150 host_owns_the_only_cycle "$home" \
+    || fail "slow stop: the park did not own the home's only watcher cycle:"$'\n'"$(home_arms "$home")"$'\n'"$(cat "$home/state/.supervision-host.log")"
+  assert_re '^acked:' "$home/state/.watcher-down" "slow stop: the take-over reopened main's handled episode as downtime"
+  assert_re "^arm_pid=[0-9]+	watcher_pid=$left_watcher	origin=attached	.*	reason=taken-over	" "$home/state/.watch-cycle-exits.log" \
+    "slow stop: the park attached to the stopping watcher instead of taking it over"
+  sleep 2
+  ! hook_exited "$home" || fail "slow stop: the take-over woke main: $(cat "$home/hook.err")"
+  assert_no_re 'rearm-resurface|a close without a wake' "$home/state/.supervision-host.log" "slow stop: the take-over resurfaced a recovery to main"
+  pass "host+hook: a take-over waits out a watcher slow to stop, so a handled wake never resurfaces"
+}
+
 # A park stopped before its take-over stops the left cycle (here held in the
 # take-over's handover snapshot by the recovery-marker lock) must not forget
 # that cycle's arm: the park the Stop hook runs next still takes it over rather
@@ -2927,6 +2983,7 @@ test_claude_stop_hook_delivers_a_close_that_turns_main_only_at_its_turn
 test_claude_stop_hook_notifies_when_at_turn_downtime_write_fails
 test_successor_close_during_main_turn_is_delivered_at_the_next_turn_end
 test_next_park_takes_over_the_cycle_a_pass_through_left_for_main
+test_take_over_of_a_slow_to_stop_watcher_keeps_the_handled_episode
 test_a_park_stopped_mid_take_over_leaves_the_take_over_to_the_next_park
 test_unrecorded_successor_is_stopped_rather_than_left_for_main
 test_primary_without_a_verified_mirror_runs_away_only
