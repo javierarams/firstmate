@@ -71,13 +71,14 @@
 # --take-over <arm-pid>: own the cycle that arm <arm-pid> owns, for an owner
 # that left a successor cycle running through main's turn and now parks again
 # (bin/fm-supervision-host.sh). Only when this home's healthy watcher is that
-# arm's own child, it stops that watcher by its locked identity: a cycle that
+# arm's own child, it stops that watcher by its locked identity and waits for
+# it to exit as long as an attached arm follows a slow holder: a cycle that
 # delivered a reason before the stop landed reports it exactly as an attached
 # arm would, and otherwise this arm owns a fresh cycle as a plain arm does.
 # Recovery restoration follows docs/watcher-continuity.md "Generation reuse";
 # an unconfirmed stop leaves downtime for the fresh cycle's recovery check.
-# Any other watcher, or one that outlives the stop,
-# is attached to exactly as a plain arm attaches.
+# Any other watcher, or one still running when its beacon reaches the stall
+# bound, is attached to exactly as a plain arm attaches.
 #
 # --stop: the same home-scoped stop without re-arming, for an owner that ends
 # its own supervision cycle on purpose (the supervision host's park boundary,
@@ -548,20 +549,38 @@ if [ "$mode" = stop ]; then
   exit 0
 fi
 
+# The signal the named arm recorded for its watcher <pid>'s close, if any.
+owner_close_signal() {  # <watcher-pid>
+  awk -F '\t' -v arm="$take_over_arm_pid" -v watcher="$1" '
+    $1 == "arm_pid=" arm && $2 == "watcher_pid=" watcher { signal = $7 }
+    END { sub(/^signal=/, "", signal); print signal }
+  ' "$CYCLE_LOG" 2>/dev/null || true
+}
+
 # Stop the watcher the named arm owns, by its locked identity, and wait for it
 # to exit (header, --take-over). Returns 3 after printing the reason that cycle
 # delivered before the stop landed, 0 once it stopped without delivering, and
 # 1 when it was not stopped (its handover state was unreadable, or it outlived
 # the stop), which leaves it to the plain attach below.
 take_over_cycle() {  # <watcher-pid> <identity>
-  local pid=$1 i owner_signal
+  local pid=$1 i signalled=0 owner_signal deadline
   cycle_begin "$pid" attached "$2"
   fm_recovery_marker_handover_snapshot "$STATE/.watcher-down" || return 1
-  if attached_holder_live "$pid"; then
-    kill -TERM "$pid" 2>/dev/null || true
+  if attached_holder_live "$pid" && kill -TERM "$pid" 2>/dev/null; then
+    signalled=1
   fi
+  # bash holds a TERM until the command substitution the watcher is running
+  # returns, so a signalled holder can outlast any short bound. Attaching to it
+  # then follows a watcher that is already dying, and its close reopens the
+  # acknowledged episode as downtime; follow it like a slow attached holder.
   i=0
-  while [ "$i" -lt 50 ] && fm_pid_alive "$pid"; do
+  while fm_pid_alive "$pid"; do
+    if [ "$signalled" -eq 1 ] && [ "$(cat "$WATCH_LOCK/pid" 2>/dev/null || true)" = "$pid" ] \
+      && [ "$(fm_path_age "$BEAT")" -lt "$STALL_BOUND" ]; then
+      sleep 0.1
+      continue
+    fi
+    [ "$i" -lt 50 ] || break
     sleep 0.1
     i=$((i + 1))
   done
@@ -574,17 +593,18 @@ take_over_cycle() {  # <watcher-pid> <identity>
     return 3
   fi
   # Only the owner can wait on this watcher and distinguish our TERM from a
-  # self-exit that raced the stop. Give its post-wait ledger append a short bound.
-  i=0
-  owner_signal=
-  while [ "$i" -lt 50 ]; do
-    owner_signal=$(awk -F '\t' -v arm="$take_over_arm_pid" -v watcher="$pid" '
-      $1 == "arm_pid=" arm && $2 == "watcher_pid=" watcher { signal = $7 }
-      END { sub(/^signal=/, "", signal); print signal }
-    ' "$CYCLE_LOG" 2>/dev/null || true)
+  # self-exit that raced the stop. It appends that row and then exits, so wait
+  # for the row while the owner still runs, within the confirmation bound.
+  deadline=$(( $(date +%s) + CONFIRM_TIMEOUT + 1 ))
+  while :; do
+    owner_signal=$(owner_close_signal "$pid")
     [ -z "$owner_signal" ] || break
+    if ! fm_pid_alive "$take_over_arm_pid"; then
+      owner_signal=$(owner_close_signal "$pid")
+      break
+    fi
+    [ "$(date +%s)" -lt "$deadline" ] || break
     sleep 0.02
-    i=$((i + 1))
   done
   if [ "$owner_signal" = TERM ]; then
     fm_recovery_marker_handover_restore "$STATE/.watcher-down" \
