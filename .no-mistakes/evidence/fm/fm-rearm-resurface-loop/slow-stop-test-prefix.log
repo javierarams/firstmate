@@ -1,0 +1,3 @@
+not ok - slow stop: the take-over reopened main's handled episode as downtime
+--- /private/var/folders/n1/7vkblp1d4lj_hc9_t82w28680000gn/T/fm-supervision-host.ZeItpK/hook-takeover-slow-stop/state/.watcher-down ---
+pending:downtime:10444.1792033113.3L3qpv
