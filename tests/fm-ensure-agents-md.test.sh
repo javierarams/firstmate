@@ -332,6 +332,65 @@ test_canonical_pointer_is_accepted_when_both_are_real_files() {
   pass "fm-ensure-agents-md.sh: canonical real CLAUDE.md pointer is not a conflict"
 }
 
+test_noncanonical_pointer_is_kept_when_both_are_real_files() {
+  local repo out variant
+  for variant in bare commented-crlf dot-slash; do
+    repo="$TMP_ROOT/both-real-noncanonical-pointer-$variant"
+    mkdir -p "$repo"
+    printf '# Existing agent memory\n\n## Maintaining this file\n\nKeep entries concise.\n' > "$repo/AGENTS.md"
+    case "$variant" in
+      bare) printf '@AGENTS.md\n' > "$repo/CLAUDE.md" ;;
+      commented-crlf) printf '<!-- See AGENTS.md -->\r\n\r\n  @AGENTS.md \r\n' > "$repo/CLAUDE.md" ;;
+      dot-slash) printf '@./AGENTS.md' > "$repo/CLAUDE.md" ;;
+    esac
+    cp "$repo/AGENTS.md" "$repo/.agents-before"
+    cp "$repo/CLAUDE.md" "$repo/.claude-before"
+    out=$("$ROOT/bin/fm-ensure-agents-md.sh" "$repo" 2>&1) \
+      || fail "fm-ensure-agents-md.sh refused a $variant CLAUDE.md pointer: $out"
+    assert_contains "$out" "unchanged:" "$variant pointer plus AGENTS.md was not reported unchanged"
+    cmp -s "$repo/.agents-before" "$repo/AGENTS.md" || fail "$variant pointer run modified AGENTS.md"
+    cmp -s "$repo/.claude-before" "$repo/CLAUDE.md" || fail "$variant pointer run rewrote CLAUDE.md"
+  done
+  pass "fm-ensure-agents-md.sh: a CLAUDE.md whose only content is an @AGENTS.md import is kept, not a conflict"
+}
+
+test_noncanonical_pointer_alone_is_not_promoted() {
+  local repo out
+  repo="$TMP_ROOT/lone-noncanonical-pointer-project"
+  mkdir -p "$repo"
+  printf '@AGENTS.md\n' > "$repo/CLAUDE.md"
+  cp "$repo/CLAUDE.md" "$repo/.claude-before"
+  out=$("$ROOT/bin/fm-ensure-agents-md.sh" "$repo" 2>&1) \
+    || fail "fm-ensure-agents-md.sh failed on a lone bare CLAUDE.md pointer: $out"
+  assert_contains "$out" "created:" "lone bare pointer did not create AGENTS.md"
+  cmp -s "$repo/.claude-before" "$repo/CLAUDE.md" || fail "lone bare pointer was rewritten"
+  if grep -Fqx '@AGENTS.md' "$repo/AGENTS.md"; then
+    fail "lone bare pointer was promoted into a self-importing AGENTS.md"
+  fi
+  grep -Fqx '## Maintaining this file' "$repo/AGENTS.md" || fail "created AGENTS.md lacks the self-governance section"
+  pass "fm-ensure-agents-md.sh: a lone bare CLAUDE.md pointer gains an AGENTS.md skeleton instead of promotion"
+}
+
+test_pointer_with_own_content_is_refused() {
+  local repo out rc variant
+  for variant in heading multiline-comment; do
+    repo="$TMP_ROOT/pointer-with-content-$variant"
+    mkdir -p "$repo"
+    printf '# Agents memory\n' > "$repo/AGENTS.md"
+    case "$variant" in
+      heading) printf '@AGENTS.md\n\n# Claude-only notes\nRun make check first.\n' > "$repo/CLAUDE.md" ;;
+      multiline-comment) printf '<!--\n@AGENTS.md\n-->\nUse tabs.\n' > "$repo/CLAUDE.md" ;;
+    esac
+    cp "$repo/CLAUDE.md" "$repo/.claude-before"
+    out=$("$ROOT/bin/fm-ensure-agents-md.sh" "$repo" 2>&1)
+    rc=$?
+    [ "$rc" -ne 0 ] || fail "expected a non-zero exit for a $variant CLAUDE.md with its own content"
+    assert_contains "$out" "conflict:" "$variant CLAUDE.md with its own content did not report a conflict"
+    cmp -s "$repo/.claude-before" "$repo/CLAUDE.md" || fail "$variant refusal modified CLAUDE.md"
+  done
+  pass "fm-ensure-agents-md.sh: refuses a CLAUDE.md with its own content beside an @AGENTS.md import"
+}
+
 test_distinct_real_files_are_refused() {
   local repo out rc
   repo="$TMP_ROOT/distinct-real-files-project"
@@ -428,6 +487,9 @@ test_existing_crlf_agents_md_without_section_preserves_crlf
 test_reworded_guidance_requires_first_line_marker
 test_marked_project_guidance_stays_unchanged
 test_canonical_pointer_is_accepted_when_both_are_real_files
+test_noncanonical_pointer_is_kept_when_both_are_real_files
+test_noncanonical_pointer_alone_is_not_promoted
+test_pointer_with_own_content_is_refused
 test_distinct_real_files_are_refused
 test_agents_md_symlink_is_refused
 test_wrong_target_symlink_is_refused

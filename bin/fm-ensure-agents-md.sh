@@ -4,9 +4,13 @@
 # real regular file whose canonical content is the two-line @AGENTS.md pointer
 # that Claude Code inlines at load time. Creates a minimal AGENTS.md skeleton
 # when neither file exists, promotes a real CLAUDE.md file when it is the only
-# file present (unless it is already the canonical pointer), converts a correct
+# file present (unless it is already a pointer), converts a correct
 # CLAUDE.md -> AGENTS.md symlink into the pointer file, and refuses to clobber
 # distinct real files or wrong symlinks.
+# An existing real CLAUDE.md counts as a pointer, and is kept as written, when
+# its only content is an @AGENTS.md (or @./AGENTS.md) import line plus optional
+# blank lines and single-line <!-- --> comments; any other content is its own
+# memory that competes with AGENTS.md.
 # Owns the canonical "## Maintaining this file" self-governance wording for
 # project AGENTS.md files, injecting it idempotently into created skeletons,
 # promoted CLAUDE.md files, and existing AGENTS.md files lacking both the exact
@@ -130,6 +134,21 @@ is_canonical_claude_pointer() {
   claude_pointer_content | cmp -s - "$CLAUDE"
 }
 
+# True when an existing real CLAUDE.md carries no memory of its own: at least
+# one @AGENTS.md import line and otherwise only blank lines or single-line HTML
+# comments, tolerating CRLF and surrounding whitespace.
+is_claude_pointer() {
+  [ -f "$CLAUDE" ] && [ ! -L "$CLAUDE" ] || return 1
+  LC_ALL=C awk '
+    { sub(/\r$/, ""); gsub(/^[ \t]+|[ \t]+$/, "") }
+    $0 == "" { next }
+    $0 == "@AGENTS.md" || $0 == "@./AGENTS.md" { imports++; next }
+    /^<!--/ && /-->$/ && index(substr($0, 5), "-->") == length($0) - 6 { next }
+    { other = 1; exit }
+    END { exit (other || !imports) }
+  ' "$CLAUDE"
+}
+
 # Write the canonical pointer as a regular file. Unlink a symlink first so the
 # write cannot follow it and destroy AGENTS.md. Never overwrite a distinct real
 # file; callers classify that as a conflict before invoking this.
@@ -220,7 +239,7 @@ if [ -e "$AGENTS" ]; then
     exit 0
   fi
   if [ -f "$CLAUDE" ]; then
-    if is_canonical_claude_pointer; then
+    if is_claude_pointer; then
       ensure_maintenance_section
       if [ "$MAINT_INJECTED" -eq 1 ]; then
         echo "updated: added ## Maintaining this file to AGENTS.md in $DIR"
@@ -249,7 +268,7 @@ fi
 
 if [ -e "$CLAUDE" ]; then
   if [ -f "$CLAUDE" ]; then
-    if is_canonical_claude_pointer; then
+    if is_claude_pointer; then
       write_skeleton
       echo "created: AGENTS.md and kept CLAUDE.md @AGENTS.md pointer in $DIR"
       exit 0
