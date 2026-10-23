@@ -1017,6 +1017,33 @@ test_bare_shell_prompt_with_command_is_not_empty
 test_bordered_shell_glyph_is_empty
 test_agent_glyphs_are_empty_bordered_and_bare
 test_empty_content_is_empty
+test_composer_claude_marked_popup_below_pair() {
+  # Claude Code 2.1.309 hangs its slash-command popup directly under the
+  # composer's closing rule and marks the popup's selected row with the
+  # prompt glyph. That indented row is popup content, so the typed composer
+  # between the rules is what is read.
+  local rule popup screen out
+  rule='────────────────────────'
+  popup=$'  ❯ /exit                Exit the CLI\n    /context             Visualize current context usage'
+  screen="$rule"$'\n❯ /exit\n'"$rule"$'\n'"$popup"
+  out=$(fm_composer_extract_selected_content "$CAPS_STYLED" "$screen")
+  [ "$out" = /exit ] || fail "a glyph-marked popup under the pair must not be read as the composer, got '$out'"
+  assert_screen "typed composer above a glyph-marked popup" pending "$CAPS_STYLED_NOID" "$screen"
+  # The move is bounded toward refusing. Under an EMPTY composer pair the same
+  # indented row is not popup proof (a popup opens only over typed text), and
+  # a row not hanging from the rule, or not indented, is a live draft.
+  screen="$rule"$'\n❯'"$NBSP"$'\n'"$rule"$'\n'"$popup"
+  out=$(fm_composer_classify_screen "$CAPS_STYLED_NOID" "$screen")
+  [ "$out" != empty ] || fail "an empty pair over an indented glyph row must never read empty"
+  screen="$rule"$'\n❯ old prompt\n'"$rule"$'\n\n❯ live draft'
+  out=$(fm_composer_extract_selected_content "$CAPS_STYLED" "$screen")
+  [ "$out" = 'live draft' ] || fail "a bare composer below a blank row must stay selected, got '$out'"
+  screen="$rule"$'\n❯ old prompt\n'"$rule"$'\n❯ live draft'
+  out=$(fm_composer_extract_selected_content "$CAPS_STYLED" "$screen")
+  [ "$out" = 'live draft' ] || fail "an unindented bare composer under the pair must stay selected, got '$out'"
+  pass "fm_composer_extract_selected_content: a glyph-marked popup under the composer moves the read up, never toward empty"
+}
+
 test_idle_placeholder_is_empty
 test_idle_placeholder_case_mode_is_explicit
 test_real_text_is_pending
@@ -1025,6 +1052,7 @@ test_matrix_claude_arrow_statusline_footer
 test_composer_footer_demotion_needs_a_proven_pair
 test_composer_footer_zone_is_shape_independent
 test_composer_footer_zone_refuses_rather_than_allows
+test_composer_claude_marked_popup_below_pair
 test_matrix_codex_dim_hint_row
 test_matrix_muse_truecolor_glyph_survives_signal_loss
 test_matrix_cursor_reverse_video_placeholder_remnant

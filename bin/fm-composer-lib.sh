@@ -1481,6 +1481,44 @@ _fm_composer_bare_rule_sandwich() {  # <plain-screen> <row>
   _fm_composer_titled_rule_row "$above" "${below//─/ }"
 }
 
+# _fm_composer_bare_row_is_rule_popup <plain-screen> <row>: whether the bare
+# agent-glyph <row> belongs to a popup hanging under a closed rule pair rather
+# than being a lower composer. Claude Code 2.1.309 draws its slash-command
+# popup directly under the composer's closing rule and marks the popup's
+# selected row with the prompt glyph (`  ❯ /exit    Exit the CLI`, verified
+# live through Herdr); 2.1.283 drew that row unmarked. Taken for a composer it
+# reads the menu as typed text, so the Herdr payload proof cleared a typed
+# /exit instead of submitting it. The row is the popup only when it is
+# indented as the popup's rows are, every row from the closing rule down to it
+# is non-blank, non-edge popup content, and the rule pair above holds its own
+# glyph row with typed text after the glyph (a popup only opens over a typed
+# command); the bare candidate then moves up to that glyph row, the composer
+# the popup hangs from. Requiring typed text there keeps the move from ever
+# turning a pending verdict into an empty one: a live draft directly under an
+# empty composer pair still wins.
+_fm_composer_bare_row_is_rule_popup() {  # <plain-screen> <row>
+  local plain=$1 row=$2 next raw trimmed glyph
+  [ "$FM_COMPOSER_SCAN_PI_PAIR_FOUND" = 1 ] || return 1
+  [ "$FM_COMPOSER_SCAN_PI_GLYPH_ROW" -ge 0 ] || return 1
+  [ "$row" -gt "$FM_COMPOSER_SCAN_PI_CLOSE" ] || return 1
+  raw=$(_fm_composer_screen_row "$row" "$plain")
+  case "$raw" in [[:space:]]*) ;; *) return 1 ;; esac
+  trimmed=$(_fm_composer_screen_row "$FM_COMPOSER_SCAN_PI_GLYPH_ROW" "$plain")
+  fm_composer_normalize_trim_var trimmed
+  fm_composer_leading_agent_glyph_var glyph "$trimmed" || return 1
+  trimmed=${trimmed#*"$glyph"}
+  fm_composer_normalize_trim_var trimmed
+  [ -n "$trimmed" ] || return 1
+  next=$((FM_COMPOSER_SCAN_PI_CLOSE + 1))
+  while [ "$next" -le "$row" ]; do
+    trimmed=$(_fm_composer_screen_row "$next" "$plain")
+    fm_composer_normalize_trim_var trimmed
+    [ -n "$trimmed" ] || return 1
+    ! fm_composer_row_has_edge "$trimmed" || return 1
+    next=$((next + 1))
+  done
+}
+
 _fm_composer_select_cursorless() {
   local plain=$1 generic=-1 next boundary raw trimmed glyph bare footer=0
   FM_COMPOSER_SELECTED_KIND=
@@ -1509,6 +1547,9 @@ _fm_composer_select_cursorless() {
     else
       bare=-1
     fi
+  fi
+  if [ "$bare" -ge 0 ] && _fm_composer_bare_row_is_rule_popup "$plain" "$bare"; then
+    bare=$FM_COMPOSER_SCAN_PI_GLYPH_ROW
   fi
   if [ "$bare" -gt "$generic" ]; then
     generic=$bare

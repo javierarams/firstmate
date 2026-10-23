@@ -25,8 +25,9 @@
 #   2. Per-harness control mechanics: which key interrupts a running turn, how
 #      many times it must be sent, whether the composer needs clearing after
 #      that key, which adapter-owned cancellation acknowledgement is observable,
-#      which command exits the agent, and which task kinds the adapter is
-#      verified to run. These are the empirically verified facts previously
+#      which command exits the agent, which confirmation that command can
+#      raise and when Enter safely answers it, and which task kinds the
+#      adapter is verified to run. These are the empirically verified facts previously
 #      carried only in the harness-adapters skill's per-adapter tables; that
 #      skill now points here so one executable owner holds them, and
 #      bin/fm-send.sh's --key path reads the same table rather than a second
@@ -231,6 +232,54 @@ fm_control_exit_command() {  # <harness>
   case "${1-}" in
     claude|opencode|grok|kimi|cursor|muse|rovo) printf '/exit' ;;
     codex|pi|pi-signed|omp|gemini|agy|devin) printf '/quit' ;;
+    *) return 1 ;;
+  esac
+}
+
+# A confirmation the exit command itself can raise instead of exiting, as an
+# ERE over the visible viewport; empty when the adapter raises none. Claude
+# asks before it exits with background work alive (a background shell, such as
+# a simulator wait loop): a `Background work is running` dialog that lists
+# what `will stop when you exit` and offers `1. Exit and stop tasks`,
+# `2. Move to background and exit`, and `3. Stay`, with the selection on the
+# first and the footer `Enter to confirm · Esc to cancel` (verified live,
+# Claude Code 2.1.309 through Herdr). Until it is answered the agent never
+# stops, so an unanswered exit times out with the agent still alive. Any one
+# of the title, the stop list, or a choice row recognizes it, so no single
+# vendor string is load-bearing for noticing it.
+fm_control_exit_confirm_signal() {  # <harness>
+  case "${1-}" in
+    claude) printf '%s' 'Background work is running|will stop when you exit|Exit and stop tasks|Move to background and exit' ;;
+    codex|opencode|pi|pi-signed|omp|grok|kimi|cursor|gemini|muse|rovo|agy|devin) ;;
+    *) return 1 ;;
+  esac
+}
+
+# How many trailing non-blank viewport rows the confirmation is read from. The
+# live dialog draws itself where the composer was, so its choices and footer
+# are always the last rows; an answered dialog's final frame can stay in the
+# terminal above the shell prompt after the agent exits (verified live, Claude
+# Code 2.1.309 through Herdr), where a later agent in the same pane must not
+# mistake it for its own. Eight rows hold the four choice and footer rows plus
+# the title and stop list for one background task.
+fm_control_exit_confirm_rows() {  # <harness>
+  case "${1-}" in
+    claude) printf '8' ;;
+    codex|opencode|pi|pi-signed|omp|grok|kimi|cursor|gemini|muse|rovo|agy|devin) ;;
+    *) return 1 ;;
+  esac
+}
+
+# The rendered row that proves Enter answers that confirmation by exiting AND
+# stopping the background work, as an ERE; the control plane presses Enter only
+# while this row is the selected one. Firstmate's key plane cannot move a
+# selection, and Enter on any other choice would either keep the agent running
+# or leave its background work orphaned past the agent that owned it, so a
+# confirmation whose selection reads otherwise is refused rather than answered.
+fm_control_exit_confirm_choice() {  # <harness>
+  case "${1-}" in
+    claude) printf '%s' '^ *❯ *([0-9]+\. *)?Exit and stop tasks *$' ;;
+    codex|opencode|pi|pi-signed|omp|grok|kimi|cursor|gemini|muse|rovo|agy|devin) ;;
     *) return 1 ;;
   esac
 }
