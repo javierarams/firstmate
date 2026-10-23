@@ -5122,6 +5122,54 @@ test_send_text_submit_claude_slash_popup_composer_is_still_proven_and_submitted(
   pass "fm_backend_herdr_send_text_submit: a typed slash command hidden behind its popup is still proven and submitted"
 }
 
+# herdr_marked_popup_composer_screen: the Claude Code 2.1.309 shape of the same
+# popup-below-composer layout (verified live through Herdr). The popup now
+# hangs directly under the composer's closing rule and marks its selected row
+# with the prompt glyph, so that row is the bottom-most bare glyph row on the
+# screen; read as a composer it made the payload proof see the menu as typed
+# text and clear the typed /exit instead of submitting it.
+herdr_marked_popup_composer_screen() {  # <typed-text>
+  local typed=$1 rule
+  rule=$(printf '%0.s\xe2\x94\x80' $(seq 1 60))
+  printf '\xe2\x8f\xba OK\n\n'
+  printf '%s\n' "$rule"
+  printf '\xe2\x9d\xaf %s\n' "$typed"
+  printf '%s\n' "$rule"
+  printf '  \xe2\x9d\xaf %s                       Exit the CLI\n' "$typed"
+  printf '    /context                    Visualize current context usage as a colored grid\n'
+  printf '    /usage-credits              Configure usage credits or request them from your admin\n'
+}
+
+test_composer_reads_claude_marked_popup_below_composer() {
+  local dir log resp fb out
+  dir="$TMP_ROOT/composer-claude-marked-popup"; mkdir -p "$dir/responses"; log="$dir/log"; resp="$dir/responses"; : > "$log"
+  herdr_marked_popup_composer_screen '/exit' > "$resp/1.out"
+  grep -q '^  ❯ /exit  ' "$resp/1.out" || fail "the fixture must carry the glyph-marked popup row"
+  fb=$(make_herdr_fakebin "$dir")
+  out=$( PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" \
+    bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_composer_content default:w1:p2' "$ROOT" )
+  [ "$out" = /exit ] || fail "a glyph-marked popup row under the composer must not be read as composer text, got '$out'"
+  pass "fm_backend_herdr_composer_content: a glyph-marked slash-command popup under the composer is not composer text"
+}
+
+test_send_text_submit_claude_marked_popup_composer_is_proven_and_submitted() {
+  local dir log resp fb out enter_count text
+  dir="$TMP_ROOT/submit-claude-marked-popup"; mkdir -p "$dir/responses"; log="$dir/log"; resp="$dir/responses"; : > "$log"
+  text='/exit'
+  herdr_submit_claude_prefix "$resp" "$text"
+  printf '{"result":{"agent":{"agent":"claude","agent_status":"idle"}}}\n' > "$resp/5.out"
+  printf '{"result":{"agent":{"agent_status":"working"}}}\n' > "$resp/7.out"
+  herdr_marked_popup_composer_screen "$text" > "$resp/4.out"
+  fb=$(make_herdr_fakebin "$dir")
+  out=$( PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" FM_BACKEND_HERDR_SUBMIT_POLLS=1 \
+    bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_send_text_submit default:w1:p2 "$1" 3 0.01 0.01' "$ROOT" "$text" )
+  [ "$out" = empty ] || fail "a composer proven above a glyph-marked popup must be submitted, got '$out'"
+  enter_count=$(grep -c $'\x1f''pane'$'\x1f''send-keys'$'\x1f''w1:p2'$'\x1f''enter' "$log")
+  [ "$enter_count" -eq 1 ] || fail "the proven typed command should be submitted once, sent $enter_count Enter(s)"
+  [ "$(herdr_ctrl_u_count "$log")" -eq 0 ] || fail "a proven composer must not be cleared"
+  pass "fm_backend_herdr_send_text_submit: a typed slash command over a glyph-marked popup is proven and submitted"
+}
+
 # Live Claude Code 2.1.283 draws a recognized typed slash command in muted
 # truecolor grey (38;2;112;112;112, luminance 112), below the grok-tuned
 # dark-foreground ghost threshold. Claude's own ghost suggestion is SGR-2 dim,
@@ -6059,6 +6107,8 @@ test_send_text_submit_accepts_marked_payloads_whose_read_back_drops_u2063
 test_send_text_submit_refuses_marked_digest_missing_its_head
 test_composer_state_claude_slash_popup_pushes_composer_above_tail_window
 test_send_text_submit_claude_slash_popup_composer_is_still_proven_and_submitted
+test_composer_reads_claude_marked_popup_below_composer
+test_send_text_submit_claude_marked_popup_composer_is_proven_and_submitted
 test_send_text_submit_claude_grey_slash_command_is_proven_and_submitted
 test_send_text_submit_lone_paste_placeholder_submits_the_long_payload
 test_send_text_submit_multiline_paste_placeholder_submits_the_long_payload
